@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | `RELAY_ADMIN_TOKEN` | Required | Random administrator token of at least 24 characters |
 | `RELAY_DB_PATH` | `data/relay.db` | Local SQLite database |
+| `RELAY_PUBLIC_URL` | Unset | Canonical browser-facing HTTP(S) origin, such as `https://relay.example.com` |
 | `RELAY_ALLOW_PRIVATE_NETWORKS` | `false` | Permit private destination addresses only in a controlled environment |
 | `RELAY_WORKER_ENABLED` | `true` | Run four worker threads with the API |
 
@@ -13,22 +14,51 @@ Normal operation is `relay serve --host 127.0.0.1 --port 8787`. The process exit
 
 ## Deployment
 
-Use a TLS reverse proxy for public access. Configure it to overwrite, rather than pass through, client-supplied forwarding headers. The CLI disables proxy header trust by default. For a trusted local proxy, launch through Uvicorn with an explicit proxy allowlist:
+Use a TLS reverse proxy for public access. Set `RELAY_PUBLIC_URL` to the exact origin visitors use, including a nonstandard port if applicable. It must not contain credentials, a path other than `/`, a query, or a fragment. Relay uses this origin for CSRF validation and sets Secure session cookies for HTTPS even when the proxy connects to Relay over HTTP. This works with `relay serve` and the supplied Docker Compose file; add the setting to `.env` for Compose.
+
+Keep the backend port private and reachable only by the proxy. Preserve the public Host header when possible. Relay does not trust client-supplied forwarding headers by default. If you also need the original client address for per-IP throttling, configure the proxy to overwrite forwarding headers and launch Uvicorn with an explicit allowlist of the proxy's actual source addresses:
 
 ```sh
 uvicorn relay.app:create_app --factory --host 127.0.0.1 --port 8787 \
   --proxy-headers --forwarded-allow-ips=127.0.0.1
 ```
 
-Keep the console and administrative API behind your private network or access gateway. Allow public access to event ingestion only when required. Add connection limits and request-rate limits at the proxy; the built-in login throttle is per process and is not a distributed protection.
+Never use `--forwarded-allow-ips='*'` on a backend reachable by untrusted clients. `RELAY_PUBLIC_URL` does not establish trust in forwarded client addresses.
+
+Keep the console and administrative API behind your private network or access gateway. Allow public access to event ingestion only when required. Add connection limits and request-rate limits at the proxy. The built-in failed-authentication throttle covers login and administrator bearer authentication, is bounded and per process, and does not reject valid credentials because another client used up the failure allowance. It is not distributed request-rate protection. Always generate the administrator token randomly; the length check cannot establish that a manually chosen token is unpredictable.
+
+The application checks credentials before returning a failure-limit response. This prevents anonymous lockout but does **not cap credential comparisons**. Enforce the request ceiling before requests reach Relay. For example, with Nginx receiving client connections directly, declare a zone in the `http` context and apply it inside your existing TLS server:
+
+```nginx
+# In http {}:
+limit_req_zone $binary_remote_addr zone=relay_admin:10m rate=5r/s;
+
+# In the configured TLS server {}:
+location /api/ {
+    limit_req zone=relay_admin burst=20 nodelay;
+    limit_req_status 429;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_pass http://127.0.0.1:8787;
+}
+```
+
+Tune the ceiling for expected traffic. Visitors sharing an IP share this budget. If Nginx itself sits behind another proxy, configure trusted client-address handling first. See the [Nginx request-limit reference](https://nginx.org/en/docs/http/ngx_http_limit_req_module.html). Keep the administrative access gateway in place; this snippet is an ingress-limit example, not a complete TLS deployment.
 
 The destination network policy is rechecked on each attempt. Keep private-network mode disabled on an internet-accessible deployment. For trusted internal destinations, enforce an outbound network allowlist in the hosting environment as well.
 
 The Docker image runs as UID 10001 with a persistent `/data` volume. Bind mounts must be writable by that UID. Allow at least 30–45 seconds for graceful shutdown; in-flight work can otherwise resume after its lease expires.
 
+On POSIX systems, Relay creates its data directory with mode 0700 and restricts the database to 0600. It does not make arbitrary existing parent directories private. Restrict existing data directories and backups to the service account, and review their permissions when upgrading. On Windows, apply equivalent filesystem ACLs to the service account; POSIX mode bits do not replace Windows ACLs. SQLite's WAL and shared-memory files also contain sensitive state and must stay inside the protected directory.
+
 ## Separate workers
 
 Set `RELAY_WORKER_ENABLED=false` for the API and run `relay worker` with the same database path, administrator configuration, and destination policy. Multiple processes on the same host can claim work safely. All must use a local filesystem and the same configuration. This is not a multi-host database setup.
+
+The scheduler allows one active delivery per endpoint and two per project by default, counted from unexpired leases across processes. It alternates eligible projects and endpoints. Three consecutive attempt timeouts pause new work for that endpoint for 30 seconds; further timeouts renew that cooldown until a non-timeout result resets it. Rate limits still apply. These limits protect other projects during an outage and can reduce peak throughput to a single receiver.
+
+DNS lookups for the same hostname are coalesced and failures have a short bounded cache. Outstanding operating-system lookups remain bounded even after a caller times out. Multiple distinct stalled hostnames can still consume resolver capacity; use a reliable local resolver and outbound network controls for sustained workloads.
 
 ## Backups and retention
 
@@ -56,4 +86,4 @@ Application logs omit payloads and secrets. The console can show response excerp
 
 ## Upgrade
 
-Back up the database, stop the service, install the new version, and restart. Version 0.1 creates schema version 1 and refuses to open a newer schema. There are no cross-version migrations yet.
+For 0.1.1, back up the database and stop **all API and worker processes** before upgrading. The next startup atomically migrates schema 1 to schema 2, preserving projects, endpoints, events, and attempt history. The migration adds scheduler state, indexes, and revocable session records. Existing 0.1.0 browser cookies require a new login. Processes refuse newer unknown schema versions; do not run mixed application versions against the same database. To roll back, stop all processes and restore the pre-upgrade backup with the old application version.

@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import secrets
 import sqlite3
@@ -46,8 +47,27 @@ CREATE INDEX IF NOT EXISTS deliveries_project ON deliveries(project_id,created_a
 CREATE INDEX IF NOT EXISTS deliveries_event ON deliveries(event_id);
 CREATE INDEX IF NOT EXISTS endpoints_project ON endpoints(project_id);
 CREATE INDEX IF NOT EXISTS attempts_delivery ON attempts(delivery_id,attempt_number);
-PRAGMA user_version = 1;
 """
+SCHEMA_VERSION = 2
+SCHEDULER_SCHEMA = """
+CREATE INDEX IF NOT EXISTS deliveries_pending_endpoint
+ ON deliveries(endpoint_id,next_attempt_at,created_at,id)
+ WHERE status IN ('pending','retrying');
+CREATE INDEX IF NOT EXISTS deliveries_processing_endpoint
+ ON deliveries(endpoint_id,lease_expires_at,created_at,id) WHERE status='processing';
+CREATE INDEX IF NOT EXISTS deliveries_processing_project
+ ON deliveries(project_id,lease_expires_at) WHERE status='processing';
+CREATE TABLE IF NOT EXISTS sessions (
+ session_hash TEXT PRIMARY KEY, expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
+"""
+PENDING_DELIVERY = """SELECT * FROM deliveries INDEXED BY deliveries_pending_endpoint
+ WHERE endpoint_id=? AND status IN ('pending','retrying') AND next_attempt_at<=?
+ ORDER BY next_attempt_at,created_at,id LIMIT 1"""
+EXPIRED_DELIVERY = """SELECT * FROM deliveries INDEXED BY deliveries_processing_endpoint
+ WHERE endpoint_id=? AND status='processing' AND lease_expires_at<=?
+ ORDER BY lease_expires_at,created_at,id LIMIT 1"""
 EVENT_SELECT = """SELECT ev.*, (SELECT COUNT(*) FROM deliveries d WHERE d.event_id=ev.id)
  AS delivery_count FROM events ev"""
 DELIVERY_SELECT = """SELECT d.id,d.project_id,d.event_id,d.endpoint_id,ev.event_type,
@@ -58,6 +78,18 @@ DELIVERY_SELECT = """SELECT d.id,d.project_id,d.event_id,d.endpoint_id,ev.event_
 STATUSES = {"pending", "processing", "retrying", "delivered", "failed"}
 
 
+class IdempotencyConflict(ValueError):
+    """An existing idempotency key identifies a different event."""
+
+
+def _utf8(value, field):
+    try:
+        value.encode("utf-8")
+    except UnicodeError as exc:
+        raise ValueError(f"{field} must contain valid Unicode") from exc
+    return value
+
+
 def _id(prefix):
     return prefix + "_" + secrets.token_hex(12)
 
@@ -65,7 +97,7 @@ def _id(prefix):
 def _text(value, field, limit=200):
     if not isinstance(value, str) or not value.strip() or len(value) > limit:
         raise ValueError(f"{field} must be a nonempty string of at most {limit} characters")
-    return value.strip()
+    return _utf8(value.strip(), field)
 
 
 def _event(row):
@@ -82,6 +114,7 @@ def _endpoint(row):
     result = dict(row)
     result.pop("signing_secret", None)
     result.pop("next_available_at", None)
+    result.pop("last_claimed_at", None)
     result["enabled"] = bool(result["enabled"])
     return result
 
@@ -115,13 +148,99 @@ class Store:
             db.close()
 
     def initialize(self):
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        parent = Path(self.path).parent
+        missing = []
+        while not parent.exists():
+            missing.append(parent)
+            parent = parent.parent
+        for directory in reversed(missing):
+            directory.mkdir(mode=0o700, exist_ok=True)
+        try:
+            descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(descriptor)
+        if os.name == "posix":
+            os.chmod(self.path, 0o600)
+            for suffix in ("-wal", "-shm"):
+                try:
+                    os.chmod(self.path + suffix, 0o600)
+                except FileNotFoundError:
+                    pass
         with self._db() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version > 1:
+            if version > SCHEMA_VERSION:
                 raise RuntimeError("Database schema is newer than this version of Relay")
             db.execute("PRAGMA journal_mode=WAL")
-            db.executescript(SCHEMA)
+            db.execute("BEGIN IMMEDIATE")
+            # Recheck after taking the writer lock: another process may have migrated.
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:
+                raise RuntimeError("Database schema is newer than this version of Relay")
+            for statement in SCHEMA.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            if version < 2:
+                additions = {
+                    "projects": {"last_claimed_at": "REAL NOT NULL DEFAULT 0"},
+                    "endpoints": {
+                        "last_claimed_at": "REAL NOT NULL DEFAULT 0",
+                        "consecutive_timeouts": "INTEGER NOT NULL DEFAULT 0",
+                        "cooldown_until": "REAL NOT NULL DEFAULT 0",
+                    },
+                }
+                for table, columns in additions.items():
+                    existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+                    for name, definition in columns.items():
+                        if name not in existing:
+                            db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+            for statement in SCHEDULER_SCHEMA.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            db.commit()
+
+    @staticmethod
+    def _session_hash(value):
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    def create_session(self, session_hash, expires_at):
+        if not self._session_hash(session_hash):
+            raise ValueError("session_hash must be a SHA-256 hexadecimal digest")
+        if not math.isfinite(expires_at):
+            raise ValueError("Session expiry must be finite")
+        with self._db(True) as db:
+            db.execute(
+                """DELETE FROM sessions WHERE session_hash IN
+                (SELECT session_hash FROM sessions WHERE expires_at<=? ORDER BY expires_at LIMIT 100)""",
+                (time.time(),),
+            )
+            db.execute(
+                """INSERT INTO sessions(session_hash,expires_at) VALUES(?,?)
+                ON CONFLICT(session_hash) DO UPDATE SET expires_at=excluded.expires_at""",
+                (session_hash, expires_at),
+            )
+
+    def valid_session(self, session_hash):
+        if not self._session_hash(session_hash):
+            return False
+        with self._db() as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM sessions WHERE session_hash=? AND expires_at>?",
+                    (session_hash, time.time()),
+                ).fetchone()
+                is not None
+            )
+
+    def revoke_session(self, session_hash):
+        with self._db(True) as db:
+            db.execute("DELETE FROM sessions WHERE session_hash=?", (session_hash,))
 
     @staticmethod
     def _require_project(db, project_id):
@@ -134,7 +253,7 @@ class Store:
         result = {"id": _id("prj"), "name": name, "created_at": time.time()}
         with self._db(True) as db:
             db.execute(
-                "INSERT INTO projects VALUES(?,?,?,?)",
+                "INSERT INTO projects(id,name,api_key_hash,created_at) VALUES(?,?,?,?)",
                 (
                     result["id"],
                     name,
@@ -177,6 +296,7 @@ class Store:
         url = _text(url, "url", 4096)
         if not isinstance(description, str) or len(description) > 2000:
             raise ValueError("Invalid description")
+        _utf8(description, "description")
         if (
             isinstance(rate_limit, bool)
             or not isinstance(rate_limit, int)
@@ -228,6 +348,7 @@ class Store:
         raw = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
         )
+        _utf8(raw, "payload")
         with self._db(True) as db:
             self._require_project(db, project_id)
             if idempotency_key is not None:
@@ -237,7 +358,9 @@ class Store:
                 ).fetchone()
                 if previous is not None:
                     if previous["event_type"] != event_type or previous["payload_json"] != raw:
-                        raise ValueError("Idempotency key was already used for a different request")
+                        raise IdempotencyConflict(
+                            "Idempotency key was already used for a different request"
+                        )
                     return _event(previous), False
             event_id, now = _id("evt"), time.time()
             db.execute(
@@ -263,6 +386,10 @@ class Store:
             )
 
     def list_deliveries(self, project_id, status=None, search=None, limit=50, offset=0):
+        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 2**63 - 1:
+            raise ValueError("offset must be between 0 and 9223372036854775807")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
         clauses, args = ["d.project_id=?"], [project_id]
         if status:
             if status not in STATUSES:
@@ -280,7 +407,7 @@ class Store:
             total = db.execute("SELECT COUNT(*) FROM (" + query + ")", args).fetchone()[0]
             rows = db.execute(
                 query + " ORDER BY d.created_at DESC,d.id DESC LIMIT ? OFFSET ?",
-                [*args, min(max(int(limit), 1), 200), max(0, int(offset))],
+                [*args, limit, offset],
             )
             return {"items": [dict(r) for r in rows], "total": total}
 
@@ -327,20 +454,71 @@ class Store:
         result["avg_latency_ms"] = round(average, 2) if average is not None else 0.0
         return result
 
-    def claim_delivery(self, lease_seconds=30):
+    @staticmethod
+    def _next_delivery(db, now, endpoint_concurrency, project_concurrency):
+        projects = db.execute(
+            """SELECT p.id FROM projects p WHERE
+            (SELECT COUNT(*) FROM deliveries d INDEXED BY deliveries_processing_project
+             WHERE d.project_id=p.id AND d.status='processing' AND d.lease_expires_at>?)<?
+            ORDER BY p.last_claimed_at,p.created_at,p.id""",
+            (now, project_concurrency),
+        )
+        for project in projects:
+            endpoints = db.execute(
+                """SELECT ep.* FROM endpoints ep
+                WHERE ep.project_id=? AND ep.enabled=1 AND ep.next_available_at<=?
+                  AND ep.cooldown_until<=? AND
+                (SELECT COUNT(*) FROM deliveries d INDEXED BY deliveries_processing_endpoint
+                 WHERE d.endpoint_id=ep.id AND d.status='processing' AND d.lease_expires_at>?)<?
+                ORDER BY ep.last_claimed_at,ep.created_at,ep.id""",
+                (project["id"], now, now, now, endpoint_concurrency),
+            )
+            for endpoint in endpoints:
+                # Each lookup reads at most one indexed candidate. Disabled/rate-limited
+                # endpoints never scan their parked deliveries while holding the writer lock.
+                candidates = [
+                    candidate
+                    for candidate in (
+                        db.execute(PENDING_DELIVERY, (endpoint["id"], now)).fetchone(),
+                        db.execute(EXPIRED_DELIVERY, (endpoint["id"], now)).fetchone(),
+                    )
+                    if candidate is not None
+                ]
+                if candidates:
+                    row = min(
+                        candidates,
+                        key=lambda candidate: (
+                            candidate["lease_expires_at"]
+                            if candidate["status"] == "processing"
+                            else candidate["next_attempt_at"],
+                            candidate["created_at"],
+                            candidate["id"],
+                        ),
+                    )
+                    event = db.execute(
+                        "SELECT event_type,payload_json FROM events WHERE id=?", (row["event_id"],)
+                    ).fetchone()
+                    return {
+                        **dict(row),
+                        **dict(event),
+                        "endpoint_url": endpoint["url"],
+                        "signing_secret": endpoint["signing_secret"],
+                        "rate_limit": endpoint["rate_limit"],
+                    }
+        return None
+
+    def claim_delivery(self, lease_seconds=30, *, endpoint_concurrency=1, project_concurrency=2):
         if not math.isfinite(lease_seconds) or lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive and finite")
+        for name, value in (
+            ("endpoint_concurrency", endpoint_concurrency),
+            ("project_concurrency", project_concurrency),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
         with self._db(True) as db:
             now = time.time()
-            row = db.execute(
-                """SELECT d.*,ep.url AS endpoint_url,ep.signing_secret,ep.rate_limit,ev.event_type,ev.payload_json
-                FROM deliveries d JOIN endpoints ep ON ep.id=d.endpoint_id JOIN events ev ON ev.id=d.event_id
-                WHERE ep.enabled=1 AND ep.next_available_at<=? AND
-                ((d.status IN ('pending','retrying') AND d.next_attempt_at<=?) OR
-                 (d.status='processing' AND d.lease_expires_at<=?))
-                ORDER BY CASE WHEN d.status='processing' THEN d.lease_expires_at ELSE d.next_attempt_at END,d.created_at,d.id LIMIT 1""",
-                (now, now, now),
-            ).fetchone()
+            row = self._next_delivery(db, now, endpoint_concurrency, project_concurrency)
             if row is None:
                 return None
             token = secrets.token_urlsafe(24)
@@ -349,9 +527,10 @@ class Store:
                 (token, now + lease_seconds, now, now, row["id"]),
             )
             db.execute(
-                "UPDATE endpoints SET next_available_at=? WHERE id=?",
-                (now + 1 / row["rate_limit"], row["endpoint_id"]),
+                "UPDATE endpoints SET next_available_at=?,last_claimed_at=? WHERE id=?",
+                (now + 1 / row["rate_limit"], now, row["endpoint_id"]),
             )
+            db.execute("UPDATE projects SET last_claimed_at=? WHERE id=?", (now, row["project_id"]))
             return {
                 **dict(row),
                 "delivery_id": row["id"],
@@ -371,11 +550,14 @@ class Store:
         response_excerpt,
         next_attempt_at=None,
         max_attempts=6,
+        timed_out=False,
     ):
         if not math.isfinite(duration_ms) or duration_ms < 0:
             raise ValueError("duration_ms must be nonnegative and finite")
         if next_attempt_at is not None and not math.isfinite(next_attempt_at):
             raise ValueError("next_attempt_at must be finite")
+        if not isinstance(timed_out, bool):
+            raise ValueError("timed_out must be a boolean")
         with self._db(True) as db:
             now = time.time()
             row = db.execute(
@@ -388,7 +570,8 @@ class Store:
             if status_code is not None and 200 <= status_code < 300:
                 status, next_attempt_at, error = "delivered", None, None
             else:
-                error = str(error or f"HTTP {status_code}" or "Delivery failed")[:2000]
+                fallback = f"HTTP {status_code}" if status_code is not None else "Delivery failed"
+                error = str(error or fallback)[:2000]
                 status = (
                     "retrying" if next_attempt_at is not None and cycle < max_attempts else "failed"
                 )
@@ -427,6 +610,18 @@ class Store:
                     delivery_id,
                 ),
             )
+            if timed_out and status != "delivered":
+                db.execute(
+                    """UPDATE endpoints SET
+                    cooldown_until=CASE WHEN consecutive_timeouts>=2 THEN ? ELSE cooldown_until END,
+                    consecutive_timeouts=MIN(consecutive_timeouts+1,3) WHERE id=?""",
+                    (now + 30, row["endpoint_id"]),
+                )
+            else:
+                db.execute(
+                    "UPDATE endpoints SET consecutive_timeouts=0,cooldown_until=0 WHERE id=?",
+                    (row["endpoint_id"],),
+                )
             return True
 
     def replay_delivery(self, project_id, delivery_id):

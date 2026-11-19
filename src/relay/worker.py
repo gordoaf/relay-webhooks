@@ -39,7 +39,7 @@ class Worker:
         if job is None:
             return False
         attempt = job["cycle_attempts"] + 1
-        configuration_error = False
+        started = time.monotonic()
         try:
             body = json.dumps(
                 {
@@ -58,12 +58,16 @@ class Worker:
                 job["endpoint_url"], body, headers, timeout=10, allow_private=self.allow_private
             )
         except (ValueError, TypeError, UnicodeError):
-            configuration_error = True
-            result = DeliveryResult(None, "Invalid delivery configuration", 0, "")
+            result = DeliveryResult(None, "Invalid delivery configuration", 0, "", permanent=True)
+        except Exception:
+            logger.exception("Unexpected delivery error for delivery=%s", job["delivery_id"])
+            result = DeliveryResult(
+                None, "Unexpected delivery error", (time.monotonic() - started) * 1000, ""
+            )
         status = result.status_code
         retryable = status is None or status in (408, 429) or 500 <= status <= 599
         next_attempt_at = None
-        if retryable and not configuration_error and attempt < self.max_attempts:
+        if retryable and not result.permanent and attempt < self.max_attempts:
             base = min(3600, self.retry_base * 2 ** min(attempt - 1, 16))
             delay = min(3600, random.uniform(base * 0.75, base * 1.25))
             if result.retry_after_seconds is not None:
@@ -78,6 +82,7 @@ class Worker:
             response_excerpt=result.response_excerpt,
             next_attempt_at=next_attempt_at,
             max_attempts=self.max_attempts,
+            timed_out=result.timed_out,
         )
         logger.info(
             "delivery=%s attempt=%s status=%s retry=%s lease_accepted=%s",
@@ -94,7 +99,7 @@ class Worker:
             try:
                 worked = self.run_once()
             except Exception:
-                logger.error("Worker cycle failed; unfinished leases will expire")
+                logger.exception("Worker cycle failed; unfinished leases will expire")
                 worked = False
             if not worked:
                 self._stopping.wait(self.poll_interval)

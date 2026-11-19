@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -20,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import __version__
 from .config import Settings
 from .delivery import validate_endpoint
-from .store import STATUSES, Store
+from .store import STATUSES, IdempotencyConflict, Store
 from .worker import Worker
 
 COOKIE = "relay_session"
@@ -85,8 +86,17 @@ class BodyLimit:
                 return
             if not message.get("more_body", False):
                 break
-        content_type = dict(scope.get("headers", [])).get(b"content-type", b"").split(b";")[0]
-        if body and (content_type == b"application/json" or content_type.endswith(b"+json")):
+        content_type = (
+            next((value for key, value in scope.get("headers", []) if key == b"content-type"), b"")
+            .split(b";", 1)[0]
+            .strip()
+            .lower()
+        )
+        if body and (
+            not content_type
+            or content_type == b"application/json"
+            or content_type.endswith(b"+json")
+        ):
             try:
                 # Reject invalid Unicode before validation errors can echo it in a response.
                 json.dumps(json.loads(body), ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -172,7 +182,8 @@ def make_worker(store, settings):
 def create_app(settings=None):
     settings = settings or Settings.from_env()
     store = Store(settings.db_path)
-    login_attempts = OrderedDict()
+    failed_attempts = OrderedDict()
+    auth_lock = threading.Lock()
     demo_setup_lock = asyncio.Lock()
 
     @asynccontextmanager
@@ -181,7 +192,7 @@ def create_app(settings=None):
             raise RuntimeError(
                 "Set RELAY_ADMIN_TOKEN to at least 24 characters, or run relay demo."
             )
-        store.initialize()
+        await asyncio.to_thread(store.initialize)
         worker = make_worker(store, settings) if settings.worker_enabled else None
         receiver = None
         try:
@@ -212,6 +223,24 @@ def create_app(settings=None):
     app.state.demo_project = app.state.demo_receiver = None
     app.add_middleware(BodyLimit, max_bytes=settings.max_payload_bytes)
 
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request, exc):
+        # Do not echo raw input: it may contain secrets, bytes or invalid Unicode.
+        def safe_text(value):
+            return value.encode("utf-8", errors="replace").decode("utf-8")
+
+        detail = [
+            {
+                "type": safe_text(error["type"]),
+                "loc": [
+                    safe_text(part) if isinstance(part, str) else part for part in error["loc"]
+                ],
+                "msg": safe_text(error["msg"]),
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse({"detail": detail}, 422)
+
     @app.middleware("http")
     async def security_headers(request, call_next):
         response = await call_next(request)
@@ -228,7 +257,8 @@ def create_app(settings=None):
         return response
 
     def check_origin(request, require_evidence=False):
-        origin, expected = request.headers.get("origin"), str(request.base_url).rstrip("/")
+        origin = request.headers.get("origin")
+        expected = settings.public_url or str(request.base_url).rstrip("/")
         if origin is not None and origin != expected:
             raise HTTPException(403, "Origin is not allowed")
         if require_evidence and not (
@@ -241,15 +271,52 @@ def create_app(settings=None):
             settings.admin_token.encode(), ("relay-session:" + value).encode(), hashlib.sha256
         ).hexdigest()
 
+    def session_hash(value):
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    def secure_cookie(request):
+        return (
+            settings.public_url.startswith("https://")
+            if settings.public_url
+            else request.url.scheme == "https"
+        )
+
+    def token_matches(value):
+        try:
+            return hmac.compare_digest(value.encode(), settings.admin_token.encode())
+        except UnicodeError:
+            return False
+
+    def auth_failure(request, detail):
+        address = request.client.host if request.client else "unknown"
+        with auth_lock:
+            now = time.monotonic()
+            attempts = failed_attempts.setdefault(address, deque())
+            failed_attempts.move_to_end(address)
+            while attempts and attempts[0] <= now - 60:
+                attempts.popleft()
+            while len(failed_attempts) > 4096:
+                failed_attempts.popitem(last=False)
+            if len(attempts) >= 10:
+                raise HTTPException(
+                    429, "Too many authentication attempts", headers={"Retry-After": "60"}
+                )
+            attempts.append(now)
+        raise HTTPException(401, detail)
+
     def valid_session(value):
         try:
+            if len(value) > 256:
+                return False
             stamp, nonce, supplied = value.split(".")
+            now = int(time.time())
             return (
                 len(nonce) == 32
-                and int(time.time()) <= int(stamp) <= int(time.time()) + SESSION_SECONDS
+                and now <= int(stamp) <= now + SESSION_SECONDS
                 and hmac.compare_digest(signature(stamp + "." + nonce), supplied)
+                and store.valid_session(session_hash(value))
             )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, UnicodeError):
             return False
 
     def bearer(request):
@@ -258,9 +325,12 @@ def create_app(settings=None):
 
     def admin(request: Request):
         token = bearer(request)
-        if token and hmac.compare_digest(token.encode(), settings.admin_token.encode()):
+        if token and token_matches(token):
             return
-        if not valid_session(request.cookies.get(COOKIE, "")):
+        cookie = request.cookies.get(COOKIE, "")
+        if not valid_session(cookie):
+            if token or cookie:
+                auth_failure(request, "Authentication required")
             raise HTTPException(401, "Authentication required")
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             check_origin(request, True)
@@ -295,34 +365,36 @@ def create_app(settings=None):
     @app.post("/api/session")
     async def login(body: Login, request: Request, response: Response):
         check_origin(request)
-        address = request.client.host if request.client else "unknown"
-        now = time.monotonic()
-        attempts = login_attempts.setdefault(address, deque())
-        login_attempts.move_to_end(address)
-        while attempts and attempts[0] < now - 60:
-            attempts.popleft()
-        while len(login_attempts) > 4096:
-            login_attempts.popitem(last=False)
-        if len(attempts) >= 10:
-            raise HTTPException(429, "Too many login attempts", headers={"Retry-After": "60"})
-        attempts.append(now)
-        if not hmac.compare_digest(body.token.encode(), settings.admin_token.encode()):
-            raise HTTPException(401, "Invalid token")
-        value = f"{int(time.time()) + SESSION_SECONDS}.{secrets.token_hex(16)}"
+        if not token_matches(body.token):
+            auth_failure(request, "Invalid token")
+        expires_at = int(time.time()) + SESSION_SECONDS
+        value = f"{expires_at}.{secrets.token_hex(16)}"
+        cookie = value + "." + signature(value)
+        await asyncio.to_thread(store.create_session, session_hash(cookie), expires_at)
         response.set_cookie(
             COOKIE,
-            value + "." + signature(value),
+            cookie,
             max_age=SESSION_SECONDS,
             httponly=True,
             samesite="strict",
-            secure=request.url.scheme == "https",
+            secure=secure_cookie(request),
             path="/",
         )
         return {"ok": True}
 
     @app.delete("/api/session", dependencies=protected)
-    def logout(response: Response):
-        response.delete_cookie(COOKIE, path="/", httponly=True, samesite="strict")
+    def logout(request: Request, response: Response):
+        cookie = request.cookies.get(COOKIE)
+        if cookie:
+            try:
+                hashed = session_hash(cookie)
+            except UnicodeError:
+                pass
+            else:
+                store.revoke_session(hashed)
+        response.delete_cookie(
+            COOKIE, path="/", httponly=True, samesite="strict", secure=secure_cookie(request)
+        )
         return {"ok": True}
 
     @app.get("/api/projects", dependencies=protected)
@@ -347,12 +419,14 @@ def create_app(settings=None):
 
     @app.post("/api/projects/{project_id}/endpoints", dependencies=protected, status_code=201)
     async def create_endpoint(project_id: str, body: EndpointInput):
-        project(project_id)
+        await asyncio.to_thread(project, project_id)
         try:
             await asyncio.to_thread(validate_endpoint, body.url, settings.allow_private_networks)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
-        return store.create_endpoint(project_id, body.url, body.description, body.rate_limit)
+        return await asyncio.to_thread(
+            store.create_endpoint, project_id, body.url, body.description, body.rate_limit
+        )
 
     @app.patch("/api/projects/{project_id}/endpoints/{endpoint_id}", dependencies=protected)
     def update_endpoint(project_id: str, endpoint_id: str, body: EndpointUpdate):
@@ -373,7 +447,7 @@ def create_app(settings=None):
         project(project_id)
         if (
             not 1 <= limit <= 200
-            or offset < 0
+            or not 0 <= offset <= 2**63 - 1
             or len(search or "") > 200
             or (status and status not in STATUSES)
         ):
@@ -416,13 +490,15 @@ def create_app(settings=None):
         ):
             raise HTTPException(422, "Invalid Idempotency-Key")
         try:
-            json.dumps(body.payload, allow_nan=False)
+            json.dumps(body.payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
         except (ValueError, TypeError):
             raise HTTPException(422, "Payload must be valid JSON with finite numbers") from None
         try:
             event, created = store.create_event(owner["id"], body.type, body.payload, key)
-        except ValueError:
+        except IdempotencyConflict:
             raise HTTPException(409, "Idempotency key was used for another event") from None
+        except (ValueError, TypeError):
+            raise HTTPException(422, "Payload must be valid JSON with finite numbers") from None
         return JSONResponse({"event": event, "created": created}, 202 if created else 200)
 
     @app.get("/api/openapi.json", dependencies=protected)
@@ -432,20 +508,24 @@ def create_app(settings=None):
     @app.post("/api/demo/setup", dependencies=protected)
     async def demo_setup():
         require_demo()
+
+        def create_fixture():
+            created = store.create_project("Demo shop")
+            endpoint = store.create_endpoint(
+                created["id"],
+                f"http://127.0.0.1:{settings.demo_receiver_port}/webhook",
+                "Demo warehouse",
+                10,
+            )
+            return {
+                "project": {k: v for k, v in created.items() if k != "api_key"},
+                "api_key": created["api_key"],
+                "endpoint": endpoint,
+            }
+
         async with demo_setup_lock:
             if app.state.demo_project is None:
-                created = store.create_project("Demo shop")
-                endpoint = store.create_endpoint(
-                    created["id"],
-                    f"http://127.0.0.1:{settings.demo_receiver_port}/webhook",
-                    "Demo warehouse",
-                    10,
-                )
-                app.state.demo_project = {
-                    "project": {k: v for k, v in created.items() if k != "api_key"},
-                    "api_key": created["api_key"],
-                    "endpoint": endpoint,
-                }
+                app.state.demo_project = await asyncio.to_thread(create_fixture)
             return app.state.demo_project
 
     @app.get("/api/demo/receiver", dependencies=protected)

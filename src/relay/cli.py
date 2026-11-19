@@ -34,6 +34,7 @@ def main():
             demo_mode=True,
             port=args.port,
             demo_receiver_port=args.receiver_port,
+            public_url="",
         )
         print(f"\nRelay demo: http://127.0.0.1:{settings.port}")
         print(f"Admin token: {settings.admin_token}")

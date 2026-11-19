@@ -23,7 +23,7 @@ SQLite runs in WAL mode with `synchronous=FULL`, foreign keys enabled, and a ten
 
 ## Claims and leases
 
-Each worker opens a short `BEGIN IMMEDIATE` transaction to claim one due row. The claim receives an unpredictable lease token and a 30-second expiration. The endpoint's next available request slot is reserved in the same transaction.
+Each worker opens a short `BEGIN IMMEDIATE` transaction to select an eligible project and endpoint, then claim one due row through endpoint-scoped indexes. Persisted last-claim times provide fair selection across projects and destinations. Unexpired processing leases enforce one active request per endpoint and two per project by default, including across worker processes. Parked deliveries do not need to be scanned to find work for another endpoint. The claim receives an unpredictable lease token and a 30-second expiration. The endpoint's next available request slot is reserved in the same transaction.
 
 Network I/O happens after releasing the database transaction. Completion starts another transaction and checks that the token still owns an unexpired lease. A stale worker cannot overwrite a newer worker's result.
 
@@ -38,9 +38,12 @@ The worker signs the entire JSON envelope, including event ID, type, creation ti
 | HTTP 2xx | Mark delivered |
 | Network error, timeout, HTTP 408/429/5xx | Retry if the cycle has attempts remaining |
 | Other HTTP status, including redirects | Mark failed |
+| Destination rejected by the network policy | Mark failed with a specific reason; do not retry |
 | Sixth unsuccessful attempt in a cycle | Mark failed |
 
-Backoff starts at two seconds, doubles per attempt, and adds 25% jitter. `Retry-After` can lengthen the delay, bounded at one hour. The total network attempt deadline is ten seconds, including DNS and reading the response excerpt. Response excerpts are capped at 4 KiB.
+Backoff starts at two seconds, doubles per attempt, and adds 25% jitter. `Retry-After` can lengthen the delay, bounded at one hour, including arbitrarily long numeric values. Unexpected delivery exceptions are recorded as failed attempts and consume the retry budget.
+
+The total network attempt deadline is ten seconds, including DNS. Connection establishment and TLS handshakes have a shorter three-second budget within that deadline. A final HTTP 2xx response acknowledges delivery without requiring its body. Error-response excerpts are optional diagnostics capped at 4 KiB and a short read budget; a slow or malformed body does not erase an already received status. Three consecutive timeouts place the endpoint in a persisted 30-second cooldown. A subsequent non-timeout response clears the consecutive-timeout count.
 
 Delivery uses the Standard Webhooks signing format: `webhook-id.timestamp.body`, HMAC-SHA256, a base64-decoded `whsec_` secret, and `v1,<base64 signature>`. The verifier checks a five-minute timestamp tolerance and uses constant-time digest comparison. It accepts multiple `v1` signatures; secret rotation itself is not exposed in this release.
 
@@ -54,7 +57,15 @@ Pausing an endpoint stops new claims and excludes it from fanout for newly submi
 
 Every attempt resolves the hostname, checks every returned address, and connects directly to a validated address. The original hostname is retained for TLS verification and the Host header. There is no second lookup in the connection path, and redirects are not followed. Proxy environment variables are not used.
 
-The default policy rejects private, loopback, link-local, reserved, multicast, and mapped addresses. Explicit private-network mode is intended for controlled internal deployments and the loopback demo. DNS calls run in a bounded pool of daemon threads because OS resolver calls cannot be reliably cancelled.
+The default policy rejects private, loopback, link-local, site-local, reserved, multicast, and mapped addresses, with explicit checks for special and IPv4-embedding ranges so older Python classification tables cannot silently weaken the boundary. Explicit private-network mode is intended for controlled internal deployments and the loopback demo.
+
+DNS calls run in a bounded pool of daemon threads because OS resolver calls cannot be reliably cancelled. Requests for the same hostname share outstanding resolution work, and failures are cached briefly with bounded memory use. Caller timeout does not release the underlying lookup's capacity until the OS call returns. This prevents one stalled hostname from filling the pool; many distinct stalled names remain a capacity limit.
+
+## Sessions and deployment origins
+
+Browser sessions require both an administrator-token HMAC and a live hashed session record in SQLite. Logout deletes that record; other processes immediately reject a copied cookie. The token signature also invalidates sessions after administrator-token rotation. Sessions expire after eight hours.
+
+When configured, `RELAY_PUBLIC_URL` defines the exact allowed browser origin and HTTPS cookie policy independently of the internal proxy connection. Forwarded headers are not trusted by the CLI. Failed login and bearer authentication share a bounded per-process throttle; valid credentials are checked before applying the failure allowance so anonymous attempts cannot lock out the administrator.
 
 ## Boundaries
 

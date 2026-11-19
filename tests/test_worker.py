@@ -1,5 +1,6 @@
 import time
 import json
+import threading
 import pytest
 import relay.worker as module
 from relay.delivery import DeliveryResult, verify_signature
@@ -79,3 +80,103 @@ def test_worker_signs_the_complete_event_envelope(store, project, endpoint, monk
         body.replace(b"order.created", b"order.deleted"),
         captured["headers"],
     )
+
+
+def test_unexpected_delivery_exception_consumes_retry_budget(
+    store, project, endpoint, monkeypatch, caplog
+):
+    store.create_event(project["id"], "test", {})
+
+    def broken_receiver(*args, **kwargs):
+        raise OverflowError("unexpected receiver parsing failure")
+
+    monkeypatch.setattr(module, "deliver", broken_receiver)
+    worker = Worker(store, max_attempts=2, retry_base=0)
+    assert worker.run_once()
+    first = store.list_deliveries(project["id"])["items"][0]
+    assert first["status"] == "retrying" and first["attempt_count"] == 1
+    with store._db(True) as db:
+        db.execute("UPDATE endpoints SET next_available_at=0")
+    assert worker.run_once()
+    last = store.delivery_detail(project["id"], first["id"])
+    assert last["status"] == "failed" and len(last["attempts"]) == 2
+    assert not worker.run_once()
+    assert any(record.exc_info for record in caplog.records)
+
+
+def test_policy_rejection_is_permanent(store, project, endpoint, monkeypatch):
+    store.create_event(project["id"], "test", {})
+    monkeypatch.setattr(
+        module,
+        "deliver",
+        lambda *a, **kw: DeliveryResult(
+            None, "Endpoint resolves to a nonpublic address", 1, "", permanent=True
+        ),
+    )
+    Worker(store).run_once()
+    row = store.list_deliveries(project["id"])["items"][0]
+    assert row["status"] == "failed" and row["attempt_count"] == 1
+    assert row["next_attempt_at"] is None
+    assert "nonpublic" in row["last_error"]
+
+
+def test_timeouts_put_endpoint_into_persistent_cooldown(store, project, endpoint, monkeypatch):
+    store.create_event(project["id"], "test", {})
+    monkeypatch.setattr(
+        module,
+        "deliver",
+        lambda *a, **kw: DeliveryResult(None, "Delivery deadline exceeded", 1, "", timed_out=True),
+    )
+    worker = Worker(store, retry_base=0)
+    for _ in range(3):
+        with store._db(True) as db:
+            db.execute("UPDATE endpoints SET next_available_at=0")
+        assert worker.run_once()
+    assert not worker.run_once()
+    with store._db() as db:
+        row = db.execute(
+            "SELECT cooldown_until FROM endpoints WHERE id=?", (endpoint["id"],)
+        ).fetchone()
+        assert row[0] > time.time() + 25
+
+
+def test_unhealthy_project_does_not_occupy_every_worker(store, monkeypatch):
+    bad = store.create_project("Unhealthy")
+    good = store.create_project("Healthy")
+    for i in range(3):
+        store.create_endpoint(bad["id"], f"https://bad-{i}.example/hook", rate_limit=1000)
+    store.create_endpoint(good["id"], "https://good.example/hook", rate_limit=1000)
+    for _ in range(4):
+        store.create_event(bad["id"], "test", {})
+    release = threading.Event()
+    busy = threading.Event()
+    healthy_delivered = threading.Event()
+    lock = threading.Lock()
+    blocked = []
+
+    def receiver(url, *args, **kwargs):
+        if "bad-" in url:
+            with lock:
+                blocked.append(url)
+                if len(blocked) == 2:
+                    busy.set()
+            release.wait(10)
+        else:
+            healthy_delivered.set()
+        return DeliveryResult(204, None, 1, "")
+
+    monkeypatch.setattr(module, "deliver", receiver)
+    worker = Worker(store, concurrency=4, poll_interval=0.01)
+    worker.start()
+    try:
+        assert busy.wait(5), "Two unhealthy destinations should be in flight"
+        store.create_event(good["id"], "test", {})
+        assert healthy_delivered.wait(5), (
+            "Healthy work must progress while bad receivers remain blocked"
+        )
+        with lock:
+            assert len(blocked) == 2
+            assert len(set(blocked)) == 2
+    finally:
+        release.set()
+        worker.stop()

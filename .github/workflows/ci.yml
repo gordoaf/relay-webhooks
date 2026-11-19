@@ -26,10 +26,25 @@ jobs:
       - name: Container smoke test
         shell: bash
         run: |
-          docker run -d --name relay-smoke -p 127.0.0.1:8787:8787 -e RELAY_ADMIN_TOKEN=test-container-token-with-32-characters relay:test
+          docker run -d --name relay-smoke -p 127.0.0.1:8787:8787 -e RELAY_ADMIN_TOKEN=test-container-token-with-32-characters -e RELAY_PUBLIC_URL=https://relay.example.test relay:test
+          ready=false
           for attempt in $(seq 1 20); do
-            if curl --fail --silent http://127.0.0.1:8787/healthz; then exit 0; fi
+            if curl --fail --silent http://127.0.0.1:8787/healthz; then ready=true; break; fi
             sleep 1
           done
-          docker logs relay-smoke
-          exit 1
+          if [ "$ready" != true ]; then docker logs relay-smoke; exit 1; fi
+          docker exec relay-smoke python -c "from pathlib import Path; import stat; assert stat.S_IMODE(Path('/data').stat().st_mode) == 0o700; assert stat.S_IMODE(Path('/data/relay.db').stat().st_mode) == 0o600"
+          python - <<'PY'
+          import json
+          import urllib.request
+          from http.cookies import SimpleCookie
+          request = urllib.request.Request(
+              'http://127.0.0.1:8787/api/session',
+              data=json.dumps({'token': 'test-container-token-with-32-characters'}).encode(),
+              headers={'Content-Type': 'application/json', 'Origin': 'https://relay.example.test'},
+          )
+          with urllib.request.urlopen(request) as response:
+              assert response.status == 200
+              cookie = SimpleCookie(response.headers['Set-Cookie'])['relay_session']
+              assert cookie['secure'] and cookie['httponly']
+          PY

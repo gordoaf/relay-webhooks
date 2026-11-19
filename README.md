@@ -119,6 +119,7 @@ Use `relay.delivery.verify_signature` against the **raw request bytes** before p
 | Signing | Standard Webhooks header/signature format with HMAC-SHA256 |
 | Isolation | Project keys ingest only into their own project; one instance administrator |
 | Destination controls | Per-endpoint rate limits and pause/resume |
+| Failure isolation | Shared endpoint/project concurrency limits, fair scheduling, and timeout cooldowns |
 | Inspection | Search, status filters, pagination, attempt history, and manual replay |
 | Network boundaries | Public addresses by default, pinned DNS answers, no redirects, bounded time and response size |
 | Installation | Python package from this repository, or Docker Compose |
@@ -134,7 +135,9 @@ python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
 
-Tests cover competing claims, stale-lease rejection, restart recovery, atomic fanout, idempotency conflicts, authentication, project isolation, request limits, signature tampering, DNS pinning, redirects, slow receivers, and retry exhaustion. CI runs on Windows and Linux and builds the container.
+Tests cover competing claims, stale-lease rejection, restart recovery, atomic fanout, idempotency conflicts, authentication, project isolation, request limits, signature tampering, DNS pinning, redirects, slow receivers, and retry exhaustion. Hardening regressions exercise worker fairness, shared concurrency limits, DNS isolation, revocable sessions, proxy origins, malicious response headers, malformed Unicode, pagination bounds, migrations, and POSIX permissions. CI runs on Windows and Linux and checks the container's health, proxy login, and data permissions.
+
+Upgrading from 0.1.0 requires stopping all API and worker processes before the schema migration. Follow the [upgrade instructions](docs/operations.md#upgrade) and take a database backup first.
 
 Run the reproducible local delivery benchmark:
 

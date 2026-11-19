@@ -3,7 +3,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 RELAY_DB_PATH=/data/relay.db
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
-RUN pip install --no-cache-dir . && useradd --system --uid 10001 relay && mkdir /data && chown relay:relay /data
+RUN pip install --no-cache-dir . && useradd --system --uid 10001 relay && mkdir -m 700 /data && chown relay:relay /data
 USER relay
 VOLUME ["/data"]
 EXPOSE 8787

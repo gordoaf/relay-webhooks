@@ -7,6 +7,7 @@ services:
     environment:
       RELAY_ADMIN_TOKEN: ${RELAY_ADMIN_TOKEN:?Set RELAY_ADMIN_TOKEN in .env}
       RELAY_DB_PATH: /data/relay.db
+      RELAY_PUBLIC_URL: ${RELAY_PUBLIC_URL:-}
     volumes:
       - relay-data:/data
     restart: unless-stopped

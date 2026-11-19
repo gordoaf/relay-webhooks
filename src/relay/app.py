@@ -1,0 +1,490 @@
+"""Administrative console and project-scoped event ingestion."""
+
+import asyncio
+import hashlib
+import hmac
+import json
+import secrets
+import threading
+import time
+from collections import OrderedDict, deque
+from contextlib import asynccontextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field
+
+from . import __version__
+from .config import Settings
+from .delivery import validate_endpoint
+from .store import STATUSES, Store
+from .worker import Worker
+
+COOKIE = "relay_session"
+SESSION_SECONDS = 8 * 60 * 60
+STATIC = Path(__file__).parent / "static"
+
+
+class Model(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class Login(Model):
+    token: str = Field(min_length=1, max_length=1024)
+
+
+class ProjectInput(Model):
+    name: str = Field(min_length=1, max_length=120)
+
+
+class EndpointInput(Model):
+    url: str = Field(min_length=8, max_length=2048)
+    description: str = Field(default="", max_length=500)
+    rate_limit: int = Field(default=10, ge=1, le=1000)
+
+
+class EndpointUpdate(Model):
+    enabled: bool
+
+
+class EventInput(Model):
+    type: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
+    payload: dict
+
+
+class ReceiverInput(Model):
+    online: bool
+
+
+class DemoSend(Model):
+    project_id: str
+    count: int = Field(default=1, ge=1, le=20)
+
+
+class BodyLimit:
+    """Bound actual request bytes, including requests without Content-Length."""
+
+    def __init__(self, app, max_bytes):
+        self.app, self.max_bytes = app, max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] not in {"POST", "PUT", "PATCH", "DELETE"}:
+            await self.app(scope, receive, send)
+            return
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            body.extend(message.get("body", b""))
+            if len(body) > self.max_bytes:
+                await JSONResponse({"detail": "Request body too large"}, 413)(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+        content_type = dict(scope.get("headers", [])).get(b"content-type", b"").split(b";")[0]
+        if body and (content_type == b"application/json" or content_type.endswith(b"+json")):
+            try:
+                # Reject invalid Unicode before validation errors can echo it in a response.
+                json.dumps(json.loads(body), ensure_ascii=False, allow_nan=False).encode("utf-8")
+            except (ValueError, UnicodeError, RecursionError):
+                await JSONResponse(
+                    {"detail": "Body must be valid UTF-8 JSON with finite numbers"}, 422
+                )(scope, receive, send)
+                return
+        delivered = False
+
+        async def buffered_receive():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return await receive()
+
+        await self.app(scope, buffered_receive, send)
+
+
+class DemoReceiver:
+    def __init__(self, port, max_bytes):
+        self.online, self.received = True, 0
+        self.seen = set()
+        self.lock = threading.Lock()
+        state = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                code = 404
+                if self.path == "/webhook":
+                    try:
+                        size = int(self.headers.get("Content-Length", "-1"))
+                        if not 0 <= size <= max_bytes:
+                            raise ValueError("Invalid request length")
+                        self.connection.settimeout(5)
+                        raw = self.rfile.read(size)
+                        if len(raw) != size:
+                            raise ValueError("Incomplete request")
+                        json.loads(raw)
+                        with state.lock:
+                            code = 204 if state.online else 503
+                            event_id = self.headers.get("webhook-id")
+                            if state.online and event_id not in state.seen:
+                                state.seen.add(event_id)
+                                state.received += 1
+                    except (ValueError, OSError):
+                        code = 400
+                self.send_response(code)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                self.close_connection = True
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def snapshot(self):
+        with self.lock:
+            return {"online": self.online, "received": self.received}
+
+
+def make_worker(store, settings):
+    return Worker(
+        store,
+        allow_private=settings.allow_private_networks,
+        max_attempts=settings.max_attempts,
+        retry_base=settings.retry_base,
+    )
+
+
+def create_app(settings=None):
+    settings = settings or Settings.from_env()
+    store = Store(settings.db_path)
+    login_attempts = OrderedDict()
+    demo_setup_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        if len(settings.admin_token) < 24:
+            raise RuntimeError(
+                "Set RELAY_ADMIN_TOKEN to at least 24 characters, or run relay demo."
+            )
+        store.initialize()
+        worker = make_worker(store, settings) if settings.worker_enabled else None
+        receiver = None
+        try:
+            if settings.demo_mode:
+                if not settings.allow_private_networks:
+                    raise RuntimeError("Demo mode requires private destinations")
+                receiver = DemoReceiver(settings.demo_receiver_port, settings.max_payload_bytes)
+                receiver.start()
+                app.state.demo_receiver = receiver
+            if worker:
+                worker.start()
+            yield
+        finally:
+            if worker:
+                await asyncio.to_thread(worker.stop)
+            if receiver:
+                await asyncio.to_thread(receiver.stop)
+
+    app = FastAPI(
+        title="Relay",
+        version=__version__,
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    app.state.store, app.state.settings = store, settings
+    app.state.demo_project = app.state.demo_receiver = None
+    app.add_middleware(BodyLimit, max_bytes=settings.max_payload_bytes)
+
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        response = await call_next(request)
+        response.headers.update(
+            {
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "Referrer-Policy": "no-referrer",
+                "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+            }
+        )
+        if request.url.path.startswith(("/api/", "/v1/")):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    def check_origin(request, require_evidence=False):
+        origin, expected = request.headers.get("origin"), str(request.base_url).rstrip("/")
+        if origin is not None and origin != expected:
+            raise HTTPException(403, "Origin is not allowed")
+        if require_evidence and not (
+            origin == expected or request.headers.get("x-relay-request") == "1"
+        ):
+            raise HTTPException(403, "Missing request origin or X-Relay-Request")
+
+    def signature(value):
+        return hmac.new(
+            settings.admin_token.encode(), ("relay-session:" + value).encode(), hashlib.sha256
+        ).hexdigest()
+
+    def valid_session(value):
+        try:
+            stamp, nonce, supplied = value.split(".")
+            return (
+                len(nonce) == 32
+                and int(time.time()) <= int(stamp) <= int(time.time()) + SESSION_SECONDS
+                and hmac.compare_digest(signature(stamp + "." + nonce), supplied)
+            )
+        except (ValueError, TypeError):
+            return False
+
+    def bearer(request):
+        scheme, _, value = request.headers.get("authorization", "").partition(" ")
+        return value if scheme.lower() == "bearer" else ""
+
+    def admin(request: Request):
+        token = bearer(request)
+        if token and hmac.compare_digest(token.encode(), settings.admin_token.encode()):
+            return
+        if not valid_session(request.cookies.get(COOKIE, "")):
+            raise HTTPException(401, "Authentication required")
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            check_origin(request, True)
+
+    protected = [Depends(admin)]
+
+    def project(project_id):
+        if not any(p["id"] == project_id for p in store.list_projects()):
+            raise HTTPException(404, "Project not found")
+
+    def delivery(project_id, delivery_id):
+        project(project_id)
+        result = store.delivery_detail(project_id, delivery_id)
+        if not result:
+            raise HTTPException(404, "Delivery not found")
+        return result
+
+    def require_demo():
+        if not settings.demo_mode:
+            raise HTTPException(404, "Demo is not enabled")
+
+    @app.get("/healthz")
+    def health():
+        with store._db() as db:
+            db.execute("SELECT 1 FROM projects LIMIT 1").fetchone()
+        return {"status": "ok", "version": __version__}
+
+    @app.get("/api/session", dependencies=protected)
+    def session():
+        return {"ok": True, "demo_enabled": settings.demo_mode}
+
+    @app.post("/api/session")
+    async def login(body: Login, request: Request, response: Response):
+        check_origin(request)
+        address = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        attempts = login_attempts.setdefault(address, deque())
+        login_attempts.move_to_end(address)
+        while attempts and attempts[0] < now - 60:
+            attempts.popleft()
+        while len(login_attempts) > 4096:
+            login_attempts.popitem(last=False)
+        if len(attempts) >= 10:
+            raise HTTPException(429, "Too many login attempts", headers={"Retry-After": "60"})
+        attempts.append(now)
+        if not hmac.compare_digest(body.token.encode(), settings.admin_token.encode()):
+            raise HTTPException(401, "Invalid token")
+        value = f"{int(time.time()) + SESSION_SECONDS}.{secrets.token_hex(16)}"
+        response.set_cookie(
+            COOKIE,
+            value + "." + signature(value),
+            max_age=SESSION_SECONDS,
+            httponly=True,
+            samesite="strict",
+            secure=request.url.scheme == "https",
+            path="/",
+        )
+        return {"ok": True}
+
+    @app.delete("/api/session", dependencies=protected)
+    def logout(response: Response):
+        response.delete_cookie(COOKIE, path="/", httponly=True, samesite="strict")
+        return {"ok": True}
+
+    @app.get("/api/projects", dependencies=protected)
+    def projects():
+        return {"projects": store.list_projects()}
+
+    @app.post("/api/projects", dependencies=protected, status_code=201)
+    def create_project(body: ProjectInput):
+        if not body.name.strip():
+            raise HTTPException(422, "Project name cannot be blank")
+        return store.create_project(body.name)
+
+    @app.post("/api/projects/{project_id}/rotate-key", dependencies=protected)
+    def rotate_key(project_id: str):
+        project(project_id)
+        return store.rotate_project_key(project_id)
+
+    @app.get("/api/projects/{project_id}/endpoints", dependencies=protected)
+    def endpoints(project_id: str):
+        project(project_id)
+        return {"endpoints": store.list_endpoints(project_id)}
+
+    @app.post("/api/projects/{project_id}/endpoints", dependencies=protected, status_code=201)
+    async def create_endpoint(project_id: str, body: EndpointInput):
+        project(project_id)
+        try:
+            await asyncio.to_thread(validate_endpoint, body.url, settings.allow_private_networks)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        return store.create_endpoint(project_id, body.url, body.description, body.rate_limit)
+
+    @app.patch("/api/projects/{project_id}/endpoints/{endpoint_id}", dependencies=protected)
+    def update_endpoint(project_id: str, endpoint_id: str, body: EndpointUpdate):
+        project(project_id)
+        result = store.set_endpoint_enabled(project_id, endpoint_id, body.enabled)
+        if result is None:
+            raise HTTPException(404, "Endpoint not found")
+        return result
+
+    @app.get("/api/projects/{project_id}/deliveries", dependencies=protected)
+    def deliveries(
+        project_id: str,
+        status: str | None = None,
+        search: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ):
+        project(project_id)
+        if (
+            not 1 <= limit <= 200
+            or offset < 0
+            or len(search or "") > 200
+            or (status and status not in STATUSES)
+        ):
+            raise HTTPException(422, "Invalid status, pagination or search")
+        return store.list_deliveries(project_id, status, search, limit, offset)
+
+    @app.get("/api/projects/{project_id}/deliveries/{delivery_id}", dependencies=protected)
+    def detail(project_id: str, delivery_id: str):
+        return delivery(project_id, delivery_id)
+
+    @app.post("/api/projects/{project_id}/deliveries/{delivery_id}/replay", dependencies=protected)
+    def replay(project_id: str, delivery_id: str):
+        delivery(project_id, delivery_id)
+        if not store.replay_delivery(project_id, delivery_id):
+            raise HTTPException(409, "Delivery is currently processing")
+        return {"ok": True}
+
+    @app.get("/api/projects/{project_id}/stats", dependencies=protected)
+    def stats(project_id: str):
+        project(project_id)
+        return store.stats(project_id)
+
+    @app.post("/api/projects/{project_id}/events", dependencies=protected)
+    def console_event(project_id: str, body: EventInput):
+        project(project_id)
+        try:
+            event, _ = store.create_event(project_id, body.type, body.payload)
+        except ValueError:
+            raise HTTPException(422, "Payload must be valid JSON with finite numbers") from None
+        return JSONResponse({"event": event, "created": True}, 202)
+
+    @app.post("/v1/events")
+    def ingest(body: EventInput, request: Request):
+        owner = store.authenticate_project(bearer(request))
+        if not owner:
+            raise HTTPException(401, "Invalid project API key")
+        key = request.headers.get("idempotency-key")
+        if key is not None and (
+            not 1 <= len(key) <= 200 or any(ord(c) < 33 or ord(c) > 126 for c in key)
+        ):
+            raise HTTPException(422, "Invalid Idempotency-Key")
+        try:
+            json.dumps(body.payload, allow_nan=False)
+        except (ValueError, TypeError):
+            raise HTTPException(422, "Payload must be valid JSON with finite numbers") from None
+        try:
+            event, created = store.create_event(owner["id"], body.type, body.payload, key)
+        except ValueError:
+            raise HTTPException(409, "Idempotency key was used for another event") from None
+        return JSONResponse({"event": event, "created": created}, 202 if created else 200)
+
+    @app.get("/api/openapi.json", dependencies=protected)
+    def openapi():
+        return app.openapi()
+
+    @app.post("/api/demo/setup", dependencies=protected)
+    async def demo_setup():
+        require_demo()
+        async with demo_setup_lock:
+            if app.state.demo_project is None:
+                created = store.create_project("Demo shop")
+                endpoint = store.create_endpoint(
+                    created["id"],
+                    f"http://127.0.0.1:{settings.demo_receiver_port}/webhook",
+                    "Demo warehouse",
+                    10,
+                )
+                app.state.demo_project = {
+                    "project": {k: v for k, v in created.items() if k != "api_key"},
+                    "api_key": created["api_key"],
+                    "endpoint": endpoint,
+                }
+            return app.state.demo_project
+
+    @app.get("/api/demo/receiver", dependencies=protected)
+    def receiver_state():
+        require_demo()
+        return app.state.demo_receiver.snapshot()
+
+    @app.post("/api/demo/receiver", dependencies=protected)
+    def receiver_toggle(body: ReceiverInput):
+        require_demo()
+        receiver = app.state.demo_receiver
+        with receiver.lock:
+            receiver.online = body.online
+        return receiver.snapshot()
+
+    @app.post("/api/demo/send", dependencies=protected)
+    def demo_send(body: DemoSend):
+        require_demo()
+        fixture = app.state.demo_project
+        if fixture is None or body.project_id != fixture["project"]["id"]:
+            raise HTTPException(422, "Set up and select the demo project first")
+        for _ in range(body.count):
+            store.create_event(
+                body.project_id,
+                "order.created",
+                {
+                    "order_id": "order_" + secrets.token_hex(4),
+                    "item": "Workshop notebook",
+                    "quantity": 1,
+                    "amount": 2400,
+                    "currency": "USD",
+                },
+            )
+        return {"created": body.count}
+
+    app.mount("/assets", StaticFiles(directory=STATIC), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    def index():
+        return FileResponse(STATIC / "index.html")
+
+    return app

@@ -1,0 +1,151 @@
+# Relay
+
+[![Tests](https://github.com/gordoaf/relay-webhooks/actions/workflows/ci.yml/badge.svg)](https://github.com/gordoaf/relay-webhooks/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-087b5c)](LICENSE)
+
+Relay is a self-hosted webhook delivery service. Send an event once, inspect every completed delivery attempt, and replay failures after fixing a receiver.
+
+It includes a delivery console, durable retries, project-scoped API keys, signed payloads, and a local failure-recovery lab. Python and SQLite run the service; the browser console has no build step.
+
+**[Try the interactive demo](https://gordoaf.github.io/relay-webhooks/)** · [Architecture](docs/architecture.md) · [API](docs/api.md) · [Operations](docs/operations.md)
+
+The public demo simulates deliveries in your browser. The local lab below sends real HTTP requests through the delivery engine.
+
+## Quickstart
+
+Requires Python 3.11 or newer.
+
+```sh
+git clone https://github.com/gordoaf/relay-webhooks.git
+cd relay-webhooks
+python -m venv .venv
+```
+
+Activate the environment:
+
+```sh
+# macOS / Linux
+source .venv/bin/activate
+```
+
+```powershell
+# Windows PowerShell; activation is optional when using the full executable path.
+.\.venv\Scripts\Activate.ps1
+```
+
+Then install and run:
+
+```sh
+python -m pip install -e .
+relay demo
+```
+
+Open **http://127.0.0.1:8787** and enter the administrator token printed in the terminal.
+
+1. Click **Set up local lab**. Save the project key if you want to send from your terminal.
+2. Click **Receiver online** to take the warehouse offline.
+3. Click **Send test event**. Its first attempt gets HTTP 503 and moves to *Retrying*.
+4. Bring the receiver back online. The next scheduled attempt gets HTTP 204.
+5. Inspect the delivery to see both attempts.
+
+The lab uses `data/demo.db` and a loopback receiver on port 8790. Private destination access is enabled for that local process. Normal server mode blocks private destinations.
+
+## Run your own instance
+
+Generate a random administrator token:
+
+```sh
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Set `RELAY_ADMIN_TOKEN` in your environment, then run `relay serve`. For example:
+
+```sh
+export RELAY_ADMIN_TOKEN='replace-with-your-generated-token'
+relay serve
+```
+
+```powershell
+$env:RELAY_ADMIN_TOKEN = 'replace-with-your-generated-token'
+relay serve
+```
+
+The console lets you create projects and endpoints. Project keys and endpoint signing secrets are shown on creation; ordinary list responses omit them.
+
+### Docker
+
+Copy `.env.example` to `.env`, set a random `RELAY_ADMIN_TOKEN`, then run:
+
+```sh
+docker compose up --build -d
+```
+
+The default port binding is loopback. The named volume preserves delivery state across container restarts. See [operations](docs/operations.md) before exposing an instance to a network.
+
+## Send an event
+
+Use a **project key**, rather than the administrator token:
+
+```sh
+curl -X POST http://127.0.0.1:8787/v1/events \
+  -H 'Authorization: Bearer YOUR_PROJECT_KEY' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-1042' \
+  -d '{"type":"order.created","payload":{"order_id":"order_1042","amount":2400,"currency":"USD"}}'
+```
+
+An accepted event returns HTTP 202 after the event and its delivery rows commit together. Repeating the same request with the same idempotency key returns the original event with HTTP 200. Reusing a key for different content returns HTTP 409.
+
+Each enabled endpoint receives a signed JSON envelope:
+
+```json
+{
+  "id": "evt_...",
+  "type": "order.created",
+  "created_at": 1795100000.0,
+  "data": {"order_id": "order_1042", "amount": 2400, "currency": "USD"}
+}
+```
+
+Use `relay.delivery.verify_signature` against the **raw request bytes** before parsing the body. See [the example receiver](examples/receiver.py) for signature verification and durable deduplication.
+
+## What this release supports
+
+| Area | Behavior |
+| --- | --- |
+| Durable acceptance | Event and endpoint fanout commit in one SQLite transaction |
+| Recovery | Expiring leases allow another worker to reclaim unfinished work |
+| Retries | Six attempts per cycle; exponential backoff with jitter; bounded `Retry-After` support |
+| Signing | Standard Webhooks header/signature format with HMAC-SHA256 |
+| Isolation | Project keys ingest only into their own project; one instance administrator |
+| Destination controls | Per-endpoint rate limits and pause/resume |
+| Inspection | Search, status filters, pagination, attempt history, and manual replay |
+| Network boundaries | Public addresses by default, pinned DNS answers, no redirects, bounded time and response size |
+| Installation | Python package from this repository, or Docker Compose |
+
+Delivery is **at least once**. A receiver can process an event and lose its response before Relay records success; the event can then be delivered again. Receivers must deduplicate by event ID. Ordering is not guaranteed.
+
+Version 0.1 targets one host with local persistent storage. It does not provide multi-region availability, enterprise SSO, per-user permissions, or an uptime SLA. The administrator can access every project. Event retention is currently indefinite; budget disk space accordingly. See [the design boundaries](docs/architecture.md#boundaries).
+
+## Development
+
+```sh
+python -m pip install -e '.[dev]'
+python -m pytest -q
+```
+
+Tests cover competing claims, stale-lease rejection, restart recovery, atomic fanout, idempotency conflicts, authentication, project isolation, request limits, signature tampering, DNS pinning, redirects, slow receivers, and retry exhaustion. CI runs on Windows and Linux and builds the container.
+
+Run the reproducible local delivery benchmark:
+
+```sh
+python examples/benchmark.py --events 200 --workers 4
+```
+
+[Recorded results and methodology](docs/benchmark.md). These measurements describe a local workload, not a hosted service capacity guarantee.
+
+## License and contact
+
+MIT licensed. Use it, modify it, and run it on your own infrastructure.
+
+For bugs and feature requests, [open an issue](https://github.com/gordoaf/relay-webhooks/issues). For integration and development inquiries, visit [GordoAF's GitHub profile](https://github.com/gordoaf).

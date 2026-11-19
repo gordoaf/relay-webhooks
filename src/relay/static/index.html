@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta
+      name="description"
+      content="Relay is a self-hosted webhook delivery service. Inspect attempts, recover failures, and keep every delivery accounted for."
+    />
+    <meta name="theme-color" content="#142235" />
+    <title>Relay · Delivery console</title>
+    <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="assets/style.css" />
+    <script src="assets/demo-config.js" defer></script>
+    <script src="assets/demo.js" defer></script>
+    <script src="assets/app.js" defer></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="#deliveries" aria-label="Relay home"
+        ><svg viewBox="0 0 32 32" aria-hidden="true">
+          <path
+            d="M5 9h13a7 7 0 0 1 0 14H7M5 9l5-5M5 9l5 5M27 23l-5-5M27 23l-5 5"
+          /></svg
+        ><span>relay<span class="brand-dot">.</span></span></a
+      >
+      <div class="workspace-label">WORKSPACE</div>
+      <label class="sr-only" for="project-select">Current project</label>
+      <select id="project-select">
+        <option value="">Choose a project</option>
+      </select>
+      <button id="new-project" class="quiet sidebar-action">
+        + New project
+      </button>
+      <nav aria-label="Main navigation">
+        <button class="nav-item active" data-view="deliveries">
+          <span aria-hidden="true">≋</span> Deliveries
+          <span id="nav-count" class="count">0</span>
+        </button>
+        <button class="nav-item" data-view="endpoints">
+          <span aria-hidden="true">⌘</span> Endpoints
+        </button>
+        <button class="nav-item" data-view="quickstart">
+          <span aria-hidden="true">⌁</span> Quickstart
+        </button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="small-status">
+          <span class="dot"></span><span id="connection-label">Connecting</span>
+        </div>
+        <a
+          href="https://github.com/gordoaf/relay-webhooks"
+          target="_blank"
+          rel="noopener"
+          >Source & documentation <span aria-hidden="true">↗</span></a
+        ><button id="logout" class="quiet">Sign out</button
+        ><span class="version">Relay v0.1.0 · MIT license</span>
+      </div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div>
+          <span class="breadcrumb">Console</span><span class="slash">/</span
+          ><span id="breadcrumb-current">Deliveries</span>
+        </div>
+        <div class="topbar-right">
+          <span id="mode-badge" class="mode-badge">SELF-HOSTED</span
+          ><button
+            id="refresh"
+            class="icon-button"
+            aria-label="Refresh console"
+          >
+            ↻
+          </button>
+        </div>
+      </header>
+      <div class="content">
+        <section id="lab" class="lab" hidden aria-label="Failure recovery lab">
+          <div class="lab-copy">
+            <span class="lab-symbol" aria-hidden="true">⌁</span>
+            <div>
+              <strong id="lab-title"
+                >Try a delivery. Then break the connection.</strong
+              >
+              <p id="lab-description">
+                Take the receiver offline, send an event, and watch Relay
+                recover.
+              </p>
+            </div>
+          </div>
+          <div class="lab-actions">
+            <button id="setup-lab" class="button lab-button">
+              Set up local lab</button
+            ><button id="toggle-receiver" class="receiver-switch">
+              <span class="dot"></span><span>Receiver online</span></button
+            ><button id="lab-send" class="button lab-button">
+              Send test event</button
+            ><button id="reset-demo" class="quiet" hidden>Reset</button>
+          </div>
+        </section>
+        <section id="view-deliveries" class="view">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">DELIVERY OPERATIONS</p>
+              <h1>Every event, accounted for.</h1>
+              <p class="subtitle">
+                Follow a delivery from the first attempt to the final response.
+              </p>
+            </div>
+            <button id="send-event" class="button primary">+ Send event</button>
+          </div>
+          <div class="metrics" aria-label="Delivery summary">
+            <article class="metric">
+              <span>Total deliveries</span><strong id="stat-total">0</strong
+              ><small>All time · current project</small>
+            </article>
+            <article class="metric">
+              <span>Delivered</span><strong id="stat-delivered">0</strong
+              ><small
+                ><span class="metric-dot green"></span
+                ><span id="stat-success">0% delivery rate</span></small
+              >
+            </article>
+            <article class="metric">
+              <span>In flight</span><strong id="stat-pending">0</strong
+              ><small
+                ><span class="metric-dot amber"></span>Queued, processing &
+                retrying</small
+              >
+            </article>
+            <article class="metric">
+              <span>Needs attention</span><strong id="stat-failed">0</strong
+              ><small
+                ><span class="metric-dot red"></span>Failed · ready to
+                inspect</small
+              >
+            </article>
+          </div>
+          <section class="panel delivery-panel">
+            <div class="panel-title">
+              <h2>Delivery stream</h2>
+              <span class="live-label"
+                ><span class="dot"></span>Updates every 2 seconds</span
+              >
+            </div>
+            <div class="filters">
+              <div class="tabs" aria-label="Delivery status">
+                <button class="tab active" data-status="">All deliveries</button
+                ><button class="tab" data-status="delivered">Delivered</button
+                ><button class="tab" data-status="retrying">Retrying</button
+                ><button class="tab" data-status="failed">Failed</button>
+              </div>
+              <label class="search"
+                ><span aria-hidden="true">⌕</span
+                ><span class="sr-only">Search event or destination</span
+                ><input
+                  id="search"
+                  type="search"
+                  placeholder="Search events or destinations"
+              /></label>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">Event</th>
+                    <th scope="col">Destination</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Attempts</th>
+                    <th scope="col">Created</th>
+                    <th scope="col"><span class="sr-only">Details</span></th>
+                  </tr>
+                </thead>
+                <tbody id="delivery-rows"></tbody>
+              </table>
+            </div>
+            <div id="empty-deliveries" class="empty-state" hidden>
+              <div class="empty-icon" aria-hidden="true">≋</div>
+              <h3>No deliveries here yet</h3>
+              <p>Add an endpoint, then send your first event.</p>
+              <button class="button" id="empty-add-endpoint">
+                Add endpoint
+              </button>
+            </div>
+            <div class="table-footer">
+              <span id="results-count">0 deliveries</span>
+              <div>
+                <button id="previous-page" class="quiet" disabled>
+                  Previous</button
+                ><span id="page-label">Page 1</span
+                ><button id="next-page" class="quiet" disabled>Next</button>
+              </div>
+            </div>
+          </section>
+          <div class="under-table">
+            <span
+              ><span class="lock-icon" aria-hidden="true">◇</span> Signed
+              payloads. Durable retries. Full attempt history.</span
+            ><button class="text-link" data-view="quickstart">
+              Connect your application
+            </button>
+          </div>
+        </section>
+        <section id="view-endpoints" class="view" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">DESTINATIONS</p>
+              <h1>Where your events go.</h1>
+              <p class="subtitle">
+                Manage receivers, signing secrets, and delivery limits.
+              </p>
+            </div>
+            <button id="add-endpoint" class="button primary">
+              + Add endpoint
+            </button>
+          </div>
+          <div id="endpoint-list" class="endpoint-list"></div>
+        </section>
+        <section id="view-quickstart" class="view" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">GET CONNECTED</p>
+              <h1>From event to endpoint.</h1>
+              <p class="subtitle">
+                One request queues a delivery for every enabled endpoint in your
+                project.
+              </p>
+            </div>
+          </div>
+          <div class="quickstart-grid">
+            <article class="panel guide">
+              <h2>Send your first event</h2>
+              <p>
+                Create a project and save its API key. Add your receiving URL
+                under Endpoints, then send an event.
+              </p>
+              <pre><code id="curl-example"></code></pre>
+              <button id="copy-curl" class="button">Copy example</button>
+              <p class="hint">
+                Replace YOUR_PROJECT_KEY with the key shown when you created the
+                project. Keep keys out of browser code.
+              </p>
+            </article>
+            <article class="panel guide">
+              <h2>Delivery behavior</h2>
+              <dl>
+                <dt>Successful delivery</dt>
+                <dd>Your endpoint returns an HTTP 2xx response.</dd>
+                <dt>Temporary failure</dt>
+                <dd>
+                  Network failures, 408, 429, and 5xx responses are retried with
+                  backoff.
+                </dd>
+                <dt>Permanent failure</dt>
+                <dd>
+                  Other errors stop delivery. Inspect the attempt and replay
+                  after fixing the receiver.
+                </dd>
+                <dt>Repeated messages</dt>
+                <dd>
+                  Delivery is at least once. Use the webhook-id header to avoid
+                  applying the same event twice.
+                </dd>
+              </dl>
+              <a
+                href="https://github.com/gordoaf/relay-webhooks#quickstart"
+                target="_blank"
+                rel="noopener"
+                class="text-link"
+                >Read the setup guide</a
+              >
+            </article>
+          </div>
+        </section>
+        <footer class="page-footer">
+          <span>Built for the moments between send and received.</span
+          ><span id="last-updated">Waiting for data</span>
+        </footer>
+      </div>
+    </main>
+    <dialog id="login-dialog" class="login-dialog">
+      <form id="login-form">
+        <div class="dialog-kicker">RELAY CONSOLE</div>
+        <h2>Your delivery operations,<br />in one place.</h2>
+        <p>Enter the administrator token configured on this server.</p>
+        <label for="admin-token">Administrator token</label
+        ><input
+          id="admin-token"
+          type="password"
+          autocomplete="current-password"
+          required
+        />
+        <p id="login-error" class="error-text" role="alert"></p>
+        <button class="button primary full-width" type="submit">
+          Open console
+        </button>
+        <p class="hint">
+          For a local trial, run <code>relay demo</code> and use the token
+          printed in your terminal.
+        </p>
+      </form>
+    </dialog>
+    <dialog id="form-dialog">
+      <form id="action-form">
+        <div class="dialog-header">
+          <h2 id="form-title"></h2>
+          <button
+            type="button"
+            class="icon-button close-dialog"
+            aria-label="Close dialog"
+          >
+            ×
+          </button>
+        </div>
+        <div id="form-fields"></div>
+        <p id="form-error" class="error-text" role="alert"></p>
+        <div class="dialog-actions">
+          <button type="button" class="button close-dialog">Cancel</button
+          ><button class="button primary" id="form-submit" type="submit">
+            Save
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="secret-dialog">
+      <div class="dialog-header">
+        <h2 id="secret-title">Save your key</h2>
+        <button class="icon-button" id="close-secret" aria-label="Close dialog">
+          ×
+        </button>
+      </div>
+      <p id="secret-description">
+        This secret is shown once. Save it somewhere secure.
+      </p>
+      <pre id="secret-value"></pre>
+      <button id="copy-secret" class="button primary">Copy to clipboard</button>
+    </dialog>
+    <dialog id="detail-dialog" class="detail-dialog">
+      <div class="dialog-header">
+        <div>
+          <p class="eyebrow">DELIVERY DETAILS</p>
+          <h2 id="detail-title"></h2>
+        </div>
+        <button
+          id="close-detail"
+          class="icon-button"
+          aria-label="Close details"
+        >
+          ×
+        </button>
+      </div>
+      <div id="detail-content"></div>
+      <div class="dialog-actions">
+        <button id="replay-delivery" class="button primary">
+          Replay delivery
+        </button>
+      </div>
+    </dialog>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>

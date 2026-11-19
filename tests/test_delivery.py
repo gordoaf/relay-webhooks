@@ -51,6 +51,29 @@ def test_unsafe_destinations_rejected(url):
         validate_endpoint(url)
 
 
+def test_signature_verifier_rejects_oversized_timestamp_without_raising():
+    headers = sign_headers(SECRET, "evt_test", b"{}", timestamp=1000)
+    headers["webhook-timestamp"] = "9" * 400
+    assert not verify_signature(SECRET, b"{}", headers, now=1000)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"now": float("nan")},
+        {"now": float("inf")},
+        {"now": 10**400},
+        {"tolerance": float("nan")},
+        {"tolerance": float("inf")},
+        {"tolerance": 10**400},
+        {"tolerance": True},
+    ],
+)
+def test_signature_verifier_rejects_invalid_time_configuration(options):
+    headers = sign_headers(SECRET, "evt_test", b"{}", timestamp=1000)
+    assert not verify_signature(SECRET, b"{}", headers, **options)
+
+
 def test_all_dns_answers_are_checked(monkeypatch):
     monkeypatch.setattr(
         socket,

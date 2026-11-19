@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import time
@@ -48,7 +49,36 @@ CREATE INDEX IF NOT EXISTS deliveries_event ON deliveries(event_id);
 CREATE INDEX IF NOT EXISTS endpoints_project ON endpoints(project_id);
 CREATE INDEX IF NOT EXISTS attempts_delivery ON attempts(delivery_id,attempt_number);
 """
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+LIFECYCLE_SCHEMA = """
+CREATE INDEX IF NOT EXISTS deliveries_failed_project
+ ON deliveries(project_id,updated_at,id) WHERE status='failed';
+CREATE TABLE IF NOT EXISTS recovery_previews (
+ id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+ filters_json TEXT NOT NULL, membership_json TEXT NOT NULL, total INTEGER NOT NULL,
+ expires_at REAL NOT NULL, created_at REAL NOT NULL, used_job_id TEXT
+);
+CREATE INDEX IF NOT EXISTS recovery_previews_project ON recovery_previews(project_id,expires_at);
+CREATE TABLE IF NOT EXISTS recovery_jobs (
+ id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+ preview_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL CHECK(status IN ('running','completed','cancelled')),
+ pace_per_second INTEGER NOT NULL, next_release_at REAL NOT NULL,
+ created_at REAL NOT NULL, updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS recovery_jobs_due ON recovery_jobs(status,next_release_at);
+CREATE INDEX IF NOT EXISTS recovery_jobs_project ON recovery_jobs(project_id,created_at);
+CREATE INDEX IF NOT EXISTS recovery_jobs_finished ON recovery_jobs(updated_at) WHERE status!='running';
+CREATE TABLE IF NOT EXISTS recovery_items (
+ job_id TEXT NOT NULL REFERENCES recovery_jobs(id) ON DELETE CASCADE,
+ delivery_id TEXT NOT NULL, event_id TEXT NOT NULL,
+ snapshot_updated_at REAL NOT NULL, snapshot_attempt_count INTEGER NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('queued','requeued','skipped','cancelled')),
+ PRIMARY KEY(job_id,delivery_id)
+);
+CREATE INDEX IF NOT EXISTS recovery_items_queued ON recovery_items(job_id,state,delivery_id);
+CREATE INDEX IF NOT EXISTS recovery_items_delivery ON recovery_items(delivery_id,state);
+CREATE INDEX IF NOT EXISTS recovery_items_event_waiting ON recovery_items(event_id,job_id) WHERE state='queued';
+"""
 SCHEDULER_SCHEMA = """
 CREATE INDEX IF NOT EXISTS deliveries_pending_endpoint
  ON deliveries(endpoint_id,next_attempt_at,created_at,id)
@@ -71,7 +101,8 @@ EXPIRED_DELIVERY = """SELECT * FROM deliveries INDEXED BY deliveries_processing_
 EVENT_SELECT = """SELECT ev.*, (SELECT COUNT(*) FROM deliveries d WHERE d.event_id=ev.id)
  AS delivery_count FROM events ev"""
 DELIVERY_SELECT = """SELECT d.id,d.project_id,d.event_id,d.endpoint_id,ev.event_type,
- ep.url AS endpoint_url,ep.enabled AS endpoint_enabled,d.status,d.attempt_count,d.cycle_attempts,
+ COALESCE(d.lease_endpoint_url,d.last_endpoint_url,ep.url) AS endpoint_url,
+ ep.url AS current_endpoint_url,ep.enabled AS endpoint_enabled,d.status,d.attempt_count,d.cycle_attempts,
  d.next_attempt_at,d.last_status_code,d.last_error,d.last_duration_ms,d.last_response_excerpt,
  d.created_at,d.updated_at FROM deliveries d JOIN events ev ON ev.id=d.event_id
  JOIN endpoints ep ON ep.id=d.endpoint_id"""
@@ -113,10 +144,56 @@ def _endpoint(row):
         return None
     result = dict(row)
     result.pop("signing_secret", None)
+    result.pop("previous_signing_secret", None)
     result.pop("next_available_at", None)
     result.pop("last_claimed_at", None)
     result["enabled"] = bool(result["enabled"])
+    result["subscriptions"] = json.loads(result.pop("subscriptions_json", '["*"]'))
     return result
+
+
+def _subscriptions(value):
+    if value is None:
+        return ["*"]
+    if not isinstance(value, list) or len(value) > 100:
+        raise ValueError("subscriptions must contain at most 100 event patterns")
+    result = []
+    for pattern in value:
+        if (
+            not isinstance(pattern, str)
+            or len(pattern) > 128
+            or not (
+                pattern == "*"
+                or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", pattern)
+                or (
+                    pattern.endswith(".*")
+                    and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", pattern[:-2])
+                )
+            )
+        ):
+            raise ValueError("subscriptions accept event names, namespace.*, or *")
+        if pattern not in result:
+            result.append(pattern)
+    return ["*"] if "*" in result else result
+
+
+def _subscribed(patterns, event_type):
+    return any(
+        pattern == "*"
+        or pattern == event_type
+        or (
+            pattern.endswith(".*")
+            and event_type.startswith(pattern[:-1])
+            and len(event_type) > len(pattern) - 1
+        )
+        for pattern in patterns
+    )
+
+
+def _overlap(value):
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 86400:
+        raise ValueError("overlap_seconds must be between 0 and 86400")
+    return value
 
 
 class Store:
@@ -126,6 +203,8 @@ class Store:
         if str(path) == ":memory:":
             raise ValueError("Use a file-backed database so deliveries survive process restarts")
         self.path = str(Path(path).expanduser().resolve())
+        self.capacity_guard = None
+        self._next_recovery_cleanup = 0
 
     @contextmanager
     def _db(self, write=False):
@@ -198,6 +277,38 @@ class Store:
             for statement in SCHEDULER_SCHEMA.split(";"):
                 if statement.strip():
                     db.execute(statement)
+            if version < 3:
+                additions = {
+                    "projects": {
+                        "previous_api_key_hash": "TEXT",
+                        "previous_key_expires_at": "REAL",
+                    },
+                    "endpoints": {
+                        "subscriptions_json": "TEXT NOT NULL DEFAULT '[\"*\"]'",
+                        "previous_signing_secret": "TEXT",
+                        "previous_secret_expires_at": "REAL",
+                    },
+                    "deliveries": {
+                        "lease_endpoint_url": "TEXT",
+                        "last_endpoint_url": "TEXT",
+                        "cycle_started_at": "REAL",
+                    },
+                    "attempts": {"endpoint_url": "TEXT"},
+                }
+                for table, columns in additions.items():
+                    existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+                    for name, definition in columns.items():
+                        if name not in existing:
+                            db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                db.execute(
+                    "UPDATE deliveries SET cycle_started_at=created_at WHERE cycle_started_at IS NULL"
+                )
+            for statement in LIFECYCLE_SCHEMA.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            from .operations import initialize_operations
+
+            initialize_operations(db)
             db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             db.commit()
 
@@ -277,26 +388,35 @@ class Store:
             return None
         with self._db() as db:
             row = db.execute(
-                "SELECT id,name,created_at FROM projects WHERE api_key_hash=?",
-                (hashlib.sha256(raw_key.encode()).hexdigest(),),
+                """SELECT id,name,created_at FROM projects WHERE api_key_hash=?
+                OR (previous_api_key_hash=? AND previous_key_expires_at>?)""",
+                (
+                    hashlib.sha256(raw_key.encode()).hexdigest(),
+                    hashlib.sha256(raw_key.encode()).hexdigest(),
+                    time.time(),
+                ),
             ).fetchone()
             return dict(row) if row else None
 
-    def rotate_project_key(self, project_id):
+    def rotate_project_key(self, project_id, overlap_seconds=0):
+        overlap_seconds = _overlap(overlap_seconds)
         key = "relay_" + secrets.token_urlsafe(32)
+        expires = time.time() + overlap_seconds if overlap_seconds else None
         with self._db(True) as db:
             self._require_project(db, project_id)
             db.execute(
-                "UPDATE projects SET api_key_hash=? WHERE id=?",
-                (hashlib.sha256(key.encode()).hexdigest(), project_id),
+                """UPDATE projects SET previous_api_key_hash=CASE WHEN ? IS NOT NULL THEN api_key_hash END,
+                previous_key_expires_at=?,api_key_hash=? WHERE id=?""",
+                (expires, expires, hashlib.sha256(key.encode()).hexdigest(), project_id),
             )
-        return {"api_key": key}
+        return {"api_key": key, "previous_valid_until": expires}
 
-    def create_endpoint(self, project_id, url, description="", rate_limit=10):
+    def create_endpoint(self, project_id, url, description="", rate_limit=10, subscriptions=None):
         url = _text(url, "url", 4096)
         if not isinstance(description, str) or len(description) > 2000:
             raise ValueError("Invalid description")
         _utf8(description, "description")
+        subscriptions = _subscriptions(subscriptions)
         if (
             isinstance(rate_limit, bool)
             or not isinstance(rate_limit, int)
@@ -308,9 +428,18 @@ class Store:
         with self._db(True) as db:
             self._require_project(db, project_id)
             db.execute(
-                """INSERT INTO endpoints(id,project_id,url,description,rate_limit,signing_secret,created_at)
-                          VALUES(?,?,?,?,?,?,?)""",
-                (endpoint_id, project_id, url, description, rate_limit, secret, time.time()),
+                """INSERT INTO endpoints(id,project_id,url,description,rate_limit,signing_secret,created_at,subscriptions_json)
+                          VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    endpoint_id,
+                    project_id,
+                    url,
+                    description,
+                    rate_limit,
+                    secret,
+                    time.time(),
+                    json.dumps(subscriptions),
+                ),
             )
             result = _endpoint(
                 db.execute("SELECT * FROM endpoints WHERE id=?", (endpoint_id,)).fetchone()
@@ -328,18 +457,64 @@ class Store:
             ]
 
     def set_endpoint_enabled(self, project_id, endpoint_id, enabled):
-        if not isinstance(enabled, bool):
-            raise ValueError("enabled must be a boolean")
+        return self.update_endpoint(project_id, endpoint_id, enabled=enabled)
+
+    def update_endpoint(self, project_id, endpoint_id, **changes):
+        if not changes or set(changes) - {
+            "url",
+            "description",
+            "rate_limit",
+            "enabled",
+            "subscriptions",
+        }:
+            raise ValueError("Provide supported endpoint fields to update")
+        values = {}
+        for name, value in changes.items():
+            if name == "url":
+                value = _text(value, "url", 4096)
+            elif name == "description":
+                if not isinstance(value, str) or len(value) > 2000:
+                    raise ValueError("Invalid description")
+                _utf8(value, "description")
+            elif name == "rate_limit":
+                if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 1000:
+                    raise ValueError("rate_limit must be between 1 and 1000")
+            elif name == "enabled":
+                if not isinstance(value, bool):
+                    raise ValueError("enabled must be a boolean")
+                value = int(value)
+            elif name == "subscriptions":
+                if value is None:
+                    raise ValueError("subscriptions must be a list")
+                name, value = "subscriptions_json", json.dumps(_subscriptions(value))
+            values[name] = value
         with self._db(True) as db:
             db.execute(
-                "UPDATE endpoints SET enabled=? WHERE id=? AND project_id=?",
-                (int(enabled), endpoint_id, project_id),
+                "UPDATE endpoints SET "
+                + ",".join(f"{name}=?" for name in values)
+                + " WHERE id=? AND project_id=?",
+                (*values.values(), endpoint_id, project_id),
             )
             return _endpoint(
                 db.execute(
                     "SELECT * FROM endpoints WHERE id=? AND project_id=?", (endpoint_id, project_id)
                 ).fetchone()
             )
+
+    def rotate_endpoint_secret(self, project_id, endpoint_id, overlap_seconds=3600):
+        overlap_seconds = _overlap(overlap_seconds)
+        secret = "whsec_" + base64.b64encode(secrets.token_bytes(32)).decode()
+        expires = time.time() + overlap_seconds if overlap_seconds else None
+        with self._db(True) as db:
+            changed = db.execute(
+                """UPDATE endpoints SET
+                previous_signing_secret=CASE WHEN ? IS NOT NULL THEN signing_secret END,
+                previous_secret_expires_at=?,signing_secret=? WHERE id=? AND project_id=?""",
+                (expires, expires, secret, endpoint_id, project_id),
+            ).rowcount
+            if not changed:
+                return None
+        return {"signing_secret": secret, "previous_valid_until": expires}
 
     def create_event(self, project_id, event_type, payload, idempotency_key=None):
         event_type = _text(event_type, "event_type")
@@ -363,17 +538,32 @@ class Store:
                         )
                     return _event(previous), False
             event_id, now = _id("evt"), time.time()
+            from .operations import check_tombstone
+
+            check_tombstone(db, project_id, idempotency_key, event_type, raw, now=now)
+            endpoints = [
+                ep
+                for ep in db.execute(
+                    "SELECT id,subscriptions_json FROM endpoints WHERE project_id=? AND enabled=1",
+                    (project_id,),
+                )
+                if _subscribed(json.loads(ep["subscriptions_json"]), event_type)
+            ]
+            if self.capacity_guard is not None:
+                self.capacity_guard(
+                    db, incoming_bytes=len(raw.encode("utf-8")), endpoint_count=len(endpoints)
+                )
             db.execute(
                 "INSERT INTO events VALUES(?,?,?,?,?,?)",
                 (event_id, project_id, event_type, raw, idempotency_key, now),
             )
-            endpoints = db.execute(
-                "SELECT id FROM endpoints WHERE project_id=? AND enabled=1", (project_id,)
-            ).fetchall()
             db.executemany(
-                """INSERT INTO deliveries(id,project_id,event_id,endpoint_id,status,next_attempt_at,created_at,updated_at)
-                              VALUES(?,?,?,?,'pending',?,?,?)""",
-                [(_id("dlv"), project_id, event_id, ep["id"], now, now, now) for ep in endpoints],
+                """INSERT INTO deliveries(id,project_id,event_id,endpoint_id,status,next_attempt_at,created_at,updated_at,cycle_started_at)
+                              VALUES(?,?,?,?,'pending',?,?,?,?)""",
+                [
+                    (_id("dlv"), project_id, event_id, ep["id"], now, now, now, now)
+                    for ep in endpoints
+                ],
             )
             return _event(db.execute(EVENT_SELECT + " WHERE ev.id=?", (event_id,)).fetchone()), True
 
@@ -503,6 +693,11 @@ class Store:
                         **dict(event),
                         "endpoint_url": endpoint["url"],
                         "signing_secret": endpoint["signing_secret"],
+                        "previous_signing_secret": (
+                            endpoint["previous_signing_secret"]
+                            if (endpoint["previous_secret_expires_at"] or 0) > now
+                            else None
+                        ),
                         "rate_limit": endpoint["rate_limit"],
                     }
         return None
@@ -523,8 +718,9 @@ class Store:
                 return None
             token = secrets.token_urlsafe(24)
             db.execute(
-                "UPDATE deliveries SET status='processing',lease_token=?,lease_expires_at=?,lease_started_at=?,updated_at=? WHERE id=?",
-                (token, now + lease_seconds, now, now, row["id"]),
+                """UPDATE deliveries SET status='processing',lease_token=?,lease_expires_at=?,
+                lease_started_at=?,lease_endpoint_url=?,updated_at=? WHERE id=?""",
+                (token, now + lease_seconds, now, row["endpoint_url"], now, row["id"]),
             )
             db.execute(
                 "UPDATE endpoints SET next_available_at=?,last_claimed_at=? WHERE id=?",
@@ -579,8 +775,8 @@ class Store:
                     next_attempt_at = None
             excerpt = str(response_excerpt or "")[:4096]
             db.execute(
-                """INSERT INTO attempts(delivery_id,attempt_number,cycle_attempt,status_code,error,duration_ms,response_excerpt,started_at,finished_at,created_at)
-                          VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO attempts(delivery_id,attempt_number,cycle_attempt,status_code,error,duration_ms,response_excerpt,started_at,finished_at,created_at,endpoint_url)
+                          VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     delivery_id,
                     number,
@@ -592,11 +788,13 @@ class Store:
                     row["lease_started_at"],
                     now,
                     now,
+                    row["lease_endpoint_url"],
                 ),
             )
             db.execute(
                 """UPDATE deliveries SET status=?,attempt_count=?,cycle_attempts=?,next_attempt_at=?,last_status_code=?,last_error=?,last_duration_ms=?,
-                          last_response_excerpt=?,updated_at=?,lease_token=NULL,lease_expires_at=NULL,lease_started_at=NULL WHERE id=?""",
+                          last_response_excerpt=?,updated_at=?,last_endpoint_url=lease_endpoint_url,
+                          lease_endpoint_url=NULL,lease_token=NULL,lease_expires_at=NULL,lease_started_at=NULL WHERE id=?""",
                 (
                     status,
                     number,
@@ -629,10 +827,350 @@ class Store:
             now = time.time()
             return (
                 db.execute(
-                    """UPDATE deliveries SET status='pending',cycle_attempts=0,next_attempt_at=?,updated_at=?,lease_token=NULL,lease_expires_at=NULL,lease_started_at=NULL,
+                    """UPDATE deliveries SET status='pending',cycle_attempts=0,next_attempt_at=?,updated_at=?,cycle_started_at=?,lease_token=NULL,lease_expires_at=NULL,lease_started_at=NULL,lease_endpoint_url=NULL,
                 last_status_code=NULL,last_error=NULL,last_duration_ms=NULL,last_response_excerpt=NULL WHERE id=? AND project_id=?
                 AND (status!='processing' OR lease_expires_at<=?)""",
-                    (now, now, delivery_id, project_id, now),
+                    (now, now, now, delivery_id, project_id, now),
                 ).rowcount
                 == 1
             )
+
+    @staticmethod
+    def _cleanup_recoveries(db, now):
+        # A completed job remains inspectable for 30 days. Preview snapshots are
+        # deliberately short lived and never expand when more failures arrive.
+        db.execute(
+            """DELETE FROM recovery_previews WHERE id IN
+                   (SELECT id FROM recovery_previews WHERE expires_at<=? LIMIT 100)""",
+            (now,),
+        )
+        db.execute(
+            """DELETE FROM recovery_jobs WHERE id IN
+                   (SELECT id FROM recovery_jobs WHERE status!='running' AND updated_at<?
+                    ORDER BY updated_at LIMIT 10)""",
+            (now - 30 * 86400,),
+        )
+        db.execute(
+            """UPDATE endpoints SET previous_signing_secret=NULL,
+                   previous_secret_expires_at=NULL WHERE previous_secret_expires_at<=?""",
+            (now,),
+        )
+        db.execute(
+            """UPDATE projects SET previous_api_key_hash=NULL,
+                   previous_key_expires_at=NULL WHERE previous_key_expires_at<=?""",
+            (now,),
+        )
+
+    def preview_recovery(self, project_id, endpoint_id=None, since=None, until=None, limit=1000):
+        """Freeze failed delivery IDs and versions; time filters use last failure time."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        for name, value in (("since", since), ("until", until)):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not 0 <= value <= 253402300799
+            ):
+                raise ValueError(f"{name} must be a finite Unix timestamp")
+        if since is not None and until is not None and since > until:
+            raise ValueError("since must be before or equal to until")
+        clauses, args = ["project_id=?", "status='failed'"], [project_id]
+        if endpoint_id is not None:
+            if not isinstance(endpoint_id, str):
+                raise ValueError("endpoint_id must be a string")
+            clauses.append("endpoint_id=?")
+            args.append(endpoint_id)
+        if since is not None:
+            clauses.append("updated_at>=?")
+            args.append(since)
+        if until is not None:
+            clauses.append("updated_at<=?")
+            args.append(until)
+        filters = {"endpoint_id": endpoint_id, "since": since, "until": until, "limit": limit}
+        now, preview_id = time.time(), _id("rpv")
+        with self._db(True) as db:
+            self._require_project(db, project_id)
+            self._cleanup_recoveries(db, now)
+            if (
+                endpoint_id is not None
+                and not db.execute(
+                    "SELECT 1 FROM endpoints WHERE id=? AND project_id=?", (endpoint_id, project_id)
+                ).fetchone()
+            ):
+                raise ValueError("Unknown endpoint")
+            if (
+                db.execute(
+                    """SELECT COUNT(*) FROM recovery_previews WHERE project_id=?
+                          AND used_job_id IS NULL AND expires_at>?""",
+                    (project_id, now),
+                ).fetchone()[0]
+                >= 10
+            ):
+                raise ValueError(
+                    "At most 10 unused recovery previews may exist per project; wait for expiry"
+                )
+            if db.execute("SELECT COUNT(*) FROM recovery_previews").fetchone()[0] >= 1000:
+                raise ValueError("Recovery preview capacity reached; wait for expiry")
+            where = " AND ".join(clauses)
+            total = db.execute("SELECT COUNT(*) FROM deliveries WHERE " + where, args).fetchone()[0]
+            members = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT id,event_id,updated_at,attempt_count FROM deliveries WHERE "
+                    + where
+                    + " ORDER BY updated_at,id LIMIT ?",
+                    (*args, limit),
+                )
+            ]
+            db.execute(
+                """INSERT INTO recovery_previews
+                       (id,project_id,filters_json,membership_json,total,expires_at,created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                (
+                    preview_id,
+                    project_id,
+                    json.dumps(filters),
+                    json.dumps(members),
+                    total,
+                    now + 900,
+                    now,
+                ),
+            )
+        return {
+            "preview_id": preview_id,
+            "total": total,
+            "selected_count": len(members),
+            "expires_at": now + 900,
+            "sample": [member["id"] for member in members[:20]],
+            "filters": filters,
+        }
+
+    @staticmethod
+    def _recovery(db, row):
+        if row is None:
+            return None
+        result = dict(row)
+        counts = {"queued": 0, "requeued": 0, "skipped": 0, "cancelled": 0}
+        for item in db.execute(
+            "SELECT state,COUNT(*) AS n FROM recovery_items WHERE job_id=? GROUP BY state",
+            (row["id"],),
+        ):
+            counts[item["state"]] = item["n"]
+        outcomes = {status: 0 for status in STATUSES}
+        outcomes["removed"] = 0
+        for item in db.execute(
+            """SELECT d.status,COUNT(*) AS n FROM recovery_items i
+                               LEFT JOIN deliveries d ON d.id=i.delivery_id
+                               WHERE i.job_id=? AND i.state='requeued' GROUP BY d.status""",
+            (row["id"],),
+        ):
+            outcomes[item["status"] or "removed"] = item["n"]
+        return {**result, **counts, "total": sum(counts.values()), "outcomes": outcomes}
+
+    def create_recovery(self, project_id, preview_id, pace_per_second=10):
+        if (
+            isinstance(pace_per_second, bool)
+            or not isinstance(pace_per_second, int)
+            or not 1 <= pace_per_second <= 1000
+        ):
+            raise ValueError("pace_per_second must be between 1 and 1000")
+        if not isinstance(preview_id, str):
+            raise ValueError("preview_id must be a string")
+        with self._db(True) as db:
+            self._require_project(db, project_id)
+            now = time.time()
+            existing = db.execute(
+                "SELECT * FROM recovery_jobs WHERE preview_id=? AND project_id=?",
+                (preview_id, project_id),
+            ).fetchone()
+            if existing:
+                if existing["pace_per_second"] != pace_per_second:
+                    raise ValueError("Preview was already started with a different pace")
+                return self._recovery(db, existing)
+            preview = db.execute(
+                "SELECT * FROM recovery_previews WHERE id=? AND project_id=? AND expires_at>?",
+                (preview_id, project_id, now),
+            ).fetchone()
+            if preview is None:
+                raise ValueError("Recovery preview is unknown or expired; create another preview")
+            if (
+                db.execute(
+                    "SELECT COUNT(*) FROM recovery_jobs WHERE project_id=?", (project_id,)
+                ).fetchone()[0]
+                >= 1000
+            ):
+                raise ValueError(
+                    "Recovery history capacity reached; completed jobs expire after 30 days"
+                )
+            if (
+                db.execute(
+                    "SELECT COUNT(*) FROM recovery_jobs WHERE project_id=? AND status='running'",
+                    (project_id,),
+                ).fetchone()[0]
+                >= 10
+            ):
+                raise ValueError("At most 10 recovery jobs may run per project")
+            if (
+                db.execute("SELECT COUNT(*) FROM recovery_jobs WHERE status='running'").fetchone()[
+                    0
+                ]
+                >= 100
+            ):
+                raise ValueError("At most 100 recovery jobs may run at once")
+            members = json.loads(preview["membership_json"])
+            job_id = _id("rcv")
+            db.execute(
+                """INSERT INTO recovery_jobs
+                       (id,project_id,preview_id,status,pace_per_second,next_release_at,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    job_id,
+                    project_id,
+                    preview_id,
+                    "running" if members else "completed",
+                    pace_per_second,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            for member in members:
+                eligible = db.execute(
+                    """SELECT 1 FROM deliveries d WHERE d.id=? AND d.project_id=?
+                    AND d.status='failed' AND d.updated_at=? AND d.attempt_count=? AND NOT EXISTS
+                    (SELECT 1 FROM recovery_items i JOIN recovery_jobs j ON j.id=i.job_id
+                     WHERE i.delivery_id=d.id AND i.state='queued' AND j.status='running')""",
+                    (member["id"], project_id, member["updated_at"], member["attempt_count"]),
+                ).fetchone()
+                db.execute(
+                    "INSERT INTO recovery_items VALUES(?,?,?,?,?,?)",
+                    (
+                        job_id,
+                        member["id"],
+                        member["event_id"],
+                        member["updated_at"],
+                        member["attempt_count"],
+                        "queued" if eligible else "skipped",
+                    ),
+                )
+            db.execute(
+                "UPDATE recovery_previews SET used_job_id=? WHERE id=?", (job_id, preview_id)
+            )
+            db.execute(
+                """UPDATE recovery_jobs SET status='completed' WHERE id=? AND NOT EXISTS
+                       (SELECT 1 FROM recovery_items WHERE job_id=? AND state='queued')""",
+                (job_id, job_id),
+            )
+            return self._recovery(
+                db, db.execute("SELECT * FROM recovery_jobs WHERE id=?", (job_id,)).fetchone()
+            )
+
+    def get_recovery(self, project_id, job_id):
+        with self._db() as db:
+            db.execute("BEGIN")
+            return self._recovery(
+                db,
+                db.execute(
+                    "SELECT * FROM recovery_jobs WHERE id=? AND project_id=?", (job_id, project_id)
+                ).fetchone(),
+            )
+
+    def list_recoveries(self, project_id, limit=50):
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        with self._db() as db:
+            db.execute("BEGIN")
+            return [
+                self._recovery(db, row)
+                for row in db.execute(
+                    "SELECT * FROM recovery_jobs WHERE project_id=? ORDER BY created_at DESC,id LIMIT ?",
+                    (project_id, limit),
+                )
+            ]
+
+    def cancel_recovery(self, project_id, job_id):
+        with self._db(True) as db:
+            row = db.execute(
+                "SELECT * FROM recovery_jobs WHERE id=? AND project_id=?", (job_id, project_id)
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] == "running":
+                db.execute(
+                    "UPDATE recovery_items SET state='cancelled' WHERE job_id=? AND state='queued'",
+                    (job_id,),
+                )
+                db.execute(
+                    "UPDATE recovery_jobs SET status='cancelled',updated_at=? WHERE id=?",
+                    (time.time(), job_id),
+                )
+            return self._recovery(
+                db, db.execute("SELECT * FROM recovery_jobs WHERE id=?", (job_id,)).fetchone()
+            )
+
+    def advance_recoveries(self):
+        """Release at most one member from each of ten due jobs, without catch-up bursts."""
+        now = time.time()
+        clean = time.monotonic() >= self._next_recovery_cleanup
+        if not clean:
+            with self._db() as db:
+                if not db.execute(
+                    "SELECT 1 FROM recovery_jobs WHERE status='running' AND next_release_at<=? LIMIT 1",
+                    (now,),
+                ).fetchone():
+                    return 0
+        with self._db(True) as db:
+            # Pace from the instant the writer reservation is acquired. Waiting
+            # behind another writer must not accumulate overdue release slots.
+            now = time.time()
+            if clean:
+                self._cleanup_recoveries(db, now)
+                self._next_recovery_cleanup = time.monotonic() + 60
+            jobs = db.execute(
+                """SELECT * FROM recovery_jobs WHERE status='running' AND next_release_at<=?
+                              ORDER BY next_release_at,created_at,id LIMIT 10""",
+                (now,),
+            ).fetchall()
+            released = 0
+            for job in jobs:
+                item = db.execute(
+                    "SELECT * FROM recovery_items WHERE job_id=? AND state='queued' ORDER BY delivery_id LIMIT 1",
+                    (job["id"],),
+                ).fetchone()
+                if item:
+                    changed = db.execute(
+                        """UPDATE deliveries SET status='pending',cycle_attempts=0,
+                        next_attempt_at=?,updated_at=?,cycle_started_at=?,lease_token=NULL,lease_expires_at=NULL,
+                        lease_started_at=NULL,lease_endpoint_url=NULL,last_status_code=NULL,
+                        last_error=NULL,last_duration_ms=NULL,last_response_excerpt=NULL
+                        WHERE id=? AND project_id=? AND status='failed' AND updated_at=? AND attempt_count=?""",
+                        (
+                            now,
+                            now,
+                            now,
+                            item["delivery_id"],
+                            job["project_id"],
+                            item["snapshot_updated_at"],
+                            item["snapshot_attempt_count"],
+                        ),
+                    ).rowcount
+                    db.execute(
+                        "UPDATE recovery_items SET state=? WHERE job_id=? AND delivery_id=?",
+                        ("requeued" if changed else "skipped", job["id"], item["delivery_id"]),
+                    )
+                    released += changed
+                remaining = db.execute(
+                    "SELECT 1 FROM recovery_items WHERE job_id=? AND state='queued' LIMIT 1",
+                    (job["id"],),
+                ).fetchone()
+                db.execute(
+                    "UPDATE recovery_jobs SET status=?,next_release_at=?,updated_at=? WHERE id=?",
+                    (
+                        "running" if remaining else "completed",
+                        now + 1 / job["pace_per_second"],
+                        now,
+                        job["id"],
+                    ),
+                )
+            return released

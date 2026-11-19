@@ -1,0 +1,14 @@
+{
+  "name": "@relay-webhooks/client",
+  "version": "0.2.0",
+  "description": "Typed Relay ingestion client and raw-body webhook verification for Node.js",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": { ".": { "types": "./index.d.ts", "import": "./index.js" } },
+  "files": ["index.js", "index.d.ts", "README.md"],
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test" },
+  "license": "MIT",
+  "private": true
+}

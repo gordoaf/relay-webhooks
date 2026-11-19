@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0 - 2026-11-19
+
+- Route new events through endpoint subscriptions, with exact types, namespace wildcards, and immutable accepted fanout.
+- Edit endpoint destinations, descriptions, and rate limits. Rotate project keys and endpoint signing secrets with bounded overlap; record actual destinations in new attempt history.
+- Preview and recover groups of failed deliveries through durable paced jobs, with progress, idempotent starts, and cancellation.
+- Add queue health, storage visibility, authenticated Prometheus metrics, persisted alerts, and independently delivered signed operator notifications.
+- Add opt-in bounded retention, explicit post-purge idempotency protection, storage admission checks, and cleanup/status commands.
+- Ship Python and TypeScript clients with stable retry idempotency, signature verification, and a runnable storefront with transactional outbox and receiver deduplication.
+- Extend the console and browser simulation for the new workflows. Migrate schema 1/2 to 3; stop all old processes and back up before upgrading. Retention remains disabled until configured.
+
 ## 0.1.1 — 2026-11-19
 
 - Isolate slow destinations with database-enforced endpoint and project concurrency limits, fair scheduling, and persistent timeout cooldowns. Use endpoint-scoped queue indexes to avoid scanning parked backlogs.

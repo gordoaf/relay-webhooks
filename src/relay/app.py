@@ -14,13 +14,14 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__
 from .config import Settings
 from .delivery import validate_endpoint
+from .operations import CapacityExceeded, IdempotencyExpired, Operations
 from .store import STATUSES, IdempotencyConflict, Store
 from .worker import Worker
 
@@ -45,10 +46,35 @@ class EndpointInput(Model):
     url: str = Field(min_length=8, max_length=2048)
     description: str = Field(default="", max_length=500)
     rate_limit: int = Field(default=10, ge=1, le=1000)
+    subscriptions: list[str] = Field(default_factory=lambda: ["*"], max_length=100)
 
 
 class EndpointUpdate(Model):
-    enabled: bool
+    enabled: bool | None = None
+    url: str | None = Field(default=None, min_length=8, max_length=2048)
+    description: str | None = Field(default=None, max_length=500)
+    rate_limit: int | None = Field(default=None, ge=1, le=1000)
+    subscriptions: list[str] | None = Field(default=None, max_length=100)
+
+
+class RotationInput(Model):
+    overlap_seconds: int = Field(default=3600, ge=0, le=86400, strict=True)
+
+
+class RecoveryPreviewInput(Model):
+    endpoint_id: str | None = Field(default=None, max_length=100)
+    since: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    until: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    limit: int = Field(default=1000, ge=1, le=1000, strict=True)
+
+
+class RecoveryInput(Model):
+    preview_id: str = Field(min_length=1, max_length=100)
+    pace_per_second: int = Field(default=10, ge=1, le=1000, strict=True)
+
+
+class CleanupInput(Model):
+    dry_run: bool = True
 
 
 class EventInput(Model):
@@ -182,6 +208,7 @@ def make_worker(store, settings):
 def create_app(settings=None):
     settings = settings or Settings.from_env()
     store = Store(settings.db_path)
+    operations = Operations(store, settings.operations_policy(), settings.allow_private_networks)
     failed_attempts = OrderedDict()
     auth_lock = threading.Lock()
     demo_setup_lock = asyncio.Lock()
@@ -204,8 +231,11 @@ def create_app(settings=None):
                 app.state.demo_receiver = receiver
             if worker:
                 worker.start()
+            if settings.maintenance_enabled:
+                operations.start()
             yield
         finally:
+            await asyncio.to_thread(operations.stop)
             if worker:
                 await asyncio.to_thread(worker.stop)
             if receiver:
@@ -220,8 +250,28 @@ def create_app(settings=None):
         openapi_url=None,
     )
     app.state.store, app.state.settings = store, settings
+    app.state.operations = operations
     app.state.demo_project = app.state.demo_receiver = None
     app.add_middleware(BodyLimit, max_bytes=settings.max_payload_bytes)
+
+    @app.exception_handler(CapacityExceeded)
+    async def capacity_error(_request, _exc):
+        return JSONResponse(
+            {"detail": "Storage capacity limit reached; event was not accepted"},
+            503,
+            headers={"Retry-After": "30"},
+        )
+
+    @app.exception_handler(IdempotencyExpired)
+    async def expired_event(_request, exc):
+        return JSONResponse(
+            {
+                "detail": "The original event was accepted but its retained data has expired. "
+                "This idempotency key cannot create another event.",
+                "event_id": exc.event_id,
+            },
+            410,
+        )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request, exc):
@@ -252,7 +302,7 @@ def create_app(settings=None):
                 "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
             }
         )
-        if request.url.path.startswith(("/api/", "/v1/")):
+        if request.url.path.startswith(("/api/", "/v1/")) or request.url.path == "/metrics":
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -408,9 +458,9 @@ def create_app(settings=None):
         return store.create_project(body.name)
 
     @app.post("/api/projects/{project_id}/rotate-key", dependencies=protected)
-    def rotate_key(project_id: str):
+    def rotate_key(project_id: str, body: RotationInput | None = None):
         project(project_id)
-        return store.rotate_project_key(project_id)
+        return store.rotate_project_key(project_id, body.overlap_seconds if body else 0)
 
     @app.get("/api/projects/{project_id}/endpoints", dependencies=protected)
     def endpoints(project_id: str):
@@ -424,16 +474,102 @@ def create_app(settings=None):
             await asyncio.to_thread(validate_endpoint, body.url, settings.allow_private_networks)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
-        return await asyncio.to_thread(
-            store.create_endpoint, project_id, body.url, body.description, body.rate_limit
-        )
+        try:
+            return await asyncio.to_thread(
+                store.create_endpoint,
+                project_id,
+                body.url,
+                body.description,
+                body.rate_limit,
+                body.subscriptions,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
 
     @app.patch("/api/projects/{project_id}/endpoints/{endpoint_id}", dependencies=protected)
-    def update_endpoint(project_id: str, endpoint_id: str, body: EndpointUpdate):
-        project(project_id)
-        result = store.set_endpoint_enabled(project_id, endpoint_id, body.enabled)
+    async def update_endpoint(project_id: str, endpoint_id: str, body: EndpointUpdate):
+        await asyncio.to_thread(project, project_id)
+        changes = body.model_dump(exclude_unset=True)
+        if not changes or any(value is None for value in changes.values()):
+            raise HTTPException(422, "Supply at least one non-null endpoint setting")
+        try:
+            if body.url is not None:
+                await asyncio.to_thread(
+                    validate_endpoint, body.url, settings.allow_private_networks
+                )
+            result = await asyncio.to_thread(
+                store.update_endpoint, project_id, endpoint_id, **changes
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
         if result is None:
             raise HTTPException(404, "Endpoint not found")
+        return result
+
+    @app.post(
+        "/api/projects/{project_id}/endpoints/{endpoint_id}/rotate-secret", dependencies=protected
+    )
+    def rotate_secret(project_id: str, endpoint_id: str, body: RotationInput | None = None):
+        project(project_id)
+        result = store.rotate_endpoint_secret(
+            project_id, endpoint_id, body.overlap_seconds if body else 3600
+        )
+        if result is None:
+            raise HTTPException(404, "Endpoint not found")
+        return result
+
+    @app.get("/api/operations", dependencies=protected)
+    def operations_summary():
+        return operations.summary()
+
+    @app.get("/api/projects/{project_id}/metrics", dependencies=protected)
+    def project_metrics(project_id: str):
+        project(project_id)
+        return operations.summary(project_id)
+
+    @app.get("/metrics", dependencies=protected, response_class=PlainTextResponse)
+    def prometheus():
+        return PlainTextResponse(operations.prometheus(), media_type="text/plain; version=0.0.4")
+
+    @app.post("/api/maintenance/cleanup", dependencies=protected)
+    def cleanup(body: CleanupInput):
+        return operations.cleanup(dry_run=body.dry_run)
+
+    @app.post("/api/projects/{project_id}/recoveries/preview", dependencies=protected)
+    def preview_recovery(project_id: str, body: RecoveryPreviewInput):
+        project(project_id)
+        try:
+            return store.preview_recovery(project_id, **body.model_dump())
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    @app.get("/api/projects/{project_id}/recoveries", dependencies=protected)
+    def recoveries(project_id: str):
+        project(project_id)
+        return {"recoveries": store.list_recoveries(project_id)}
+
+    @app.post("/api/projects/{project_id}/recoveries", dependencies=protected, status_code=201)
+    def start_recovery(project_id: str, body: RecoveryInput):
+        project(project_id)
+        try:
+            return store.create_recovery(project_id, body.preview_id, body.pace_per_second)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    @app.get("/api/projects/{project_id}/recoveries/{recovery_id}", dependencies=protected)
+    def recovery_detail(project_id: str, recovery_id: str):
+        project(project_id)
+        result = store.get_recovery(project_id, recovery_id)
+        if result is None:
+            raise HTTPException(404, "Recovery not found")
+        return result
+
+    @app.post("/api/projects/{project_id}/recoveries/{recovery_id}/cancel", dependencies=protected)
+    def cancel_recovery(project_id: str, recovery_id: str):
+        project(project_id)
+        result = store.cancel_recovery(project_id, recovery_id)
+        if result is None:
+            raise HTTPException(404, "Recovery not found")
         return result
 
     @app.get("/api/projects/{project_id}/deliveries", dependencies=protected)

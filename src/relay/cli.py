@@ -1,11 +1,15 @@
 import argparse
+import json
 import secrets
 import signal
 import threading
 from dataclasses import replace
+
 import uvicorn
+
 from .app import create_app, make_worker
 from .config import Settings
+from .operations import Operations
 from .store import Store
 
 
@@ -16,6 +20,9 @@ def main():
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8787)
     commands.add_parser("worker", help="Run a separate delivery worker")
+    cleanup = commands.add_parser("cleanup", help="Preview or apply one bounded retention batch")
+    cleanup.add_argument("--apply", action="store_true", help="Delete eligible retained history")
+    commands.add_parser("status", help="Print queue health, storage use, and alerts as JSON")
     demo = commands.add_parser("demo", help="Run a local demonstration with a receiver")
     demo.add_argument("--port", type=int, default=8787)
     demo.add_argument("--receiver-port", type=int, default=8790)
@@ -39,20 +46,32 @@ def main():
         print(f"\nRelay demo: http://127.0.0.1:{settings.port}")
         print(f"Admin token: {settings.admin_token}")
         print("Local lab: private destinations are enabled for this process.\n", flush=True)
-    elif len(settings.admin_token) < 24:
+    elif args.command in {"serve", "worker"} and len(settings.admin_token) < 24:
         parser.error("Set RELAY_ADMIN_TOKEN to at least 24 characters, or use relay demo.")
-    if args.command == "worker":
+    if args.command in {"worker", "cleanup", "status"}:
         store = Store(settings.db_path)
         store.initialize()
+        operations = Operations(
+            store, settings.operations_policy(), settings.allow_private_networks
+        )
+        if args.command == "cleanup":
+            print(json.dumps(operations.cleanup(dry_run=not args.apply), indent=2))
+            return
+        if args.command == "status":
+            print(json.dumps(operations.summary(), indent=2))
+            return
         worker = make_worker(store, settings)
         stopped = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: stopped.set())
         try:
             worker.start()
+            if settings.maintenance_enabled:
+                operations.start()
             stopped.wait()
         except KeyboardInterrupt:
             pass
         finally:
+            operations.stop()
             worker.stop()
         return
     if args.command == "serve":

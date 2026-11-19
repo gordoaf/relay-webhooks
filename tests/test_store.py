@@ -310,10 +310,26 @@ def _legacy_database(path):
 def test_v1_migration_preserves_events_attempts_and_keys(tmp_path):
     legacy = _legacy_database(tmp_path / "legacy.db")
     project = legacy.create_project("Existing")
-    endpoint = legacy.create_endpoint(project["id"], "https://existing.example/")
-    event = submit(legacy, project)
-    delivery = legacy.list_deliveries(project["id"])["items"][0]
+    # Populate the original schema directly: current Store methods intentionally
+    # require initialization/migration before use.
+    endpoint = {"id": "ep_legacy", "signing_secret": "whsec_legacy"}
+    event = {"id": "evt_legacy"}
+    delivery = {"id": "dlv_legacy"}
     with legacy._db(True) as db:
+        db.execute(
+            """INSERT INTO endpoints(id,project_id,url,rate_limit,signing_secret,created_at)
+                   VALUES(?,?,'https://existing.example/',10,?,1)""",
+            (endpoint["id"], project["id"], endpoint["signing_secret"]),
+        )
+        db.execute(
+            "INSERT INTO events VALUES(?,?, 'order.created',?,NULL,1)",
+            (event["id"], project["id"], '{"order_id":12}'),
+        )
+        db.execute(
+            """INSERT INTO deliveries(id,project_id,event_id,endpoint_id,status,created_at,updated_at)
+                   VALUES(?,?,?,?,'pending',1,1)""",
+            (delivery["id"], project["id"], event["id"], endpoint["id"]),
+        )
         db.execute("UPDATE deliveries SET status='delivered',attempt_count=1,last_status_code=204")
         db.execute(
             """INSERT INTO attempts(delivery_id,attempt_number,cycle_attempt,status_code,duration_ms,
@@ -327,7 +343,7 @@ def test_v1_migration_preserves_events_attempts_and_keys(tmp_path):
     detail = legacy.delivery_detail(project["id"], delivery["id"])
     assert detail["status"] == "delivered" and detail["attempts"][0]["status_code"] == 204
     with legacy._db() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == module.SCHEMA_VERSION
         assert (
             db.execute("SELECT signing_secret FROM endpoints").fetchone()[0]
             == endpoint["signing_secret"]
@@ -351,11 +367,11 @@ def test_migration_rolls_back_on_failure(tmp_path, monkeypatch):
 
 def test_newer_schema_is_rejected(store):
     with store._db() as db:
-        db.execute("PRAGMA user_version=3")
+        db.execute(f"PRAGMA user_version={module.SCHEMA_VERSION + 1}")
     with pytest.raises(RuntimeError, match="newer"):
         store.initialize()
     with store._db() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == module.SCHEMA_VERSION + 1
 
 
 def test_sessions_persist_expire_and_revoke_across_instances(store):

@@ -35,9 +35,10 @@ class Worker:
         self._threads = []
 
     def run_once(self):
+        released = self.store.advance_recoveries()
         job = self.store.claim_delivery(lease_seconds=30)
         if job is None:
-            return False
+            return bool(released)
         attempt = job["cycle_attempts"] + 1
         started = time.monotonic()
         try:
@@ -52,7 +53,12 @@ class Worker:
                 separators=(",", ":"),
                 ensure_ascii=False,
             ).encode("utf-8")
-            headers = sign_headers(job["signing_secret"], job["event_id"], body)
+            headers = sign_headers(
+                job["signing_secret"],
+                job["event_id"],
+                body,
+                previous_secret=job.get("previous_signing_secret"),
+            )
             headers["webhook-type"] = job["event_type"]
             result = deliver(
                 job["endpoint_url"], body, headers, timeout=10, allow_private=self.allow_private

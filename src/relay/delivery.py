@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import http.client
 import ipaddress
+import math
 from collections import OrderedDict
 import socket
 import ssl
@@ -264,14 +265,18 @@ def _secret_bytes(secret):
     return decoded
 
 
-def sign_headers(secret, event_id, payload, timestamp=None):
+def sign_headers(secret, event_id, payload, timestamp=None, *, previous_secret=None):
     stamp = str(int(time.time() if timestamp is None else timestamp))
     message = event_id.encode() + b"." + stamp.encode() + b"." + payload
-    digest = hmac.new(_secret_bytes(secret), message, hashlib.sha256).digest()
+    signatures = []
+    for signing_secret in (secret, previous_secret):
+        if signing_secret is not None:
+            digest = hmac.new(_secret_bytes(signing_secret), message, hashlib.sha256).digest()
+            signatures.append("v1," + base64.b64encode(digest).decode())
     return {
         "webhook-id": event_id,
         "webhook-timestamp": stamp,
-        "webhook-signature": "v1," + base64.b64encode(digest).decode(),
+        "webhook-signature": " ".join(signatures),
     }
 
 
@@ -279,9 +284,17 @@ def verify_signature(secret, payload, headers, tolerance=300, now=None):
     try:
         values = {k.lower(): v for k, v in headers.items()}
         event_id, stamp = values["webhook-id"], values["webhook-timestamp"]
-        if not event_id or not stamp.isascii() or not stamp.isdigit():
+        if not event_id or len(stamp) > 20 or not stamp.isascii() or not stamp.isdigit():
             return False
-        if tolerance < 0 or abs((time.time() if now is None else now) - int(stamp)) > tolerance:
+        current_time = time.time() if now is None else now
+        if (
+            type(tolerance) not in (int, float)
+            or not math.isfinite(tolerance)
+            or tolerance < 0
+            or type(current_time) not in (int, float)
+            or not math.isfinite(current_time)
+            or abs(current_time - int(stamp)) > tolerance
+        ):
             return False
         message = event_id.encode() + b"." + stamp.encode() + b"." + payload
         expected = hmac.new(_secret_bytes(secret), message, hashlib.sha256).digest()
@@ -296,7 +309,7 @@ def verify_signature(secret, payload, headers, tolerance=300, now=None):
                 continue
             matched |= hmac.compare_digest(expected, supplied)
         return matched
-    except (KeyError, TypeError, ValueError, AttributeError):
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
         return False
 
 

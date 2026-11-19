@@ -43,6 +43,12 @@
         <button class="nav-item" data-view="quickstart">
           <span aria-hidden="true">⌁</span> Quickstart
         </button>
+        <button class="nav-item" data-view="operations">
+          <span aria-hidden="true">◷</span> Health & storage
+        </button>
+        <button class="nav-item" data-view="recovery">
+          <span aria-hidden="true">↺</span> Bulk recovery
+        </button>
       </nav>
       <div class="sidebar-bottom">
         <div class="small-status">
@@ -54,7 +60,7 @@
           rel="noopener"
           >Source & documentation <span aria-hidden="true">↗</span></a
         ><button id="logout" class="quiet">Sign out</button
-        ><span class="version">Relay v0.1.1 · MIT license</span>
+        ><span class="version">Relay v0.2.0 · MIT license</span>
       </div>
     </aside>
     <main>
@@ -112,7 +118,7 @@
           <div class="metrics" aria-label="Delivery summary">
             <article class="metric">
               <span>Total deliveries</span><strong id="stat-total">0</strong
-              ><small>All time · current project</small>
+              ><small>Retained history · current project</small>
             </article>
             <article class="metric">
               <span>Delivered</span><strong id="stat-delivered">0</strong
@@ -222,8 +228,8 @@
               <p class="eyebrow">GET CONNECTED</p>
               <h1>From event to endpoint.</h1>
               <p class="subtitle">
-                One request queues a delivery for every enabled endpoint in your
-                project.
+                One request queues a delivery for each matching, enabled
+                endpoint in your project.
               </p>
             </div>
           </div>
@@ -239,6 +245,18 @@
               <p class="hint">
                 Replace YOUR_PROJECT_KEY with the key shown when you created the
                 project. Keep keys out of browser code.
+              </p>
+              <a
+                class="text-link"
+                href="https://github.com/gordoaf/relay-webhooks/blob/main/docs/integration.md"
+                target="_blank"
+                rel="noopener"
+                >Python, TypeScript & the sample storefront ↗</a
+              >
+              <p>
+                <button id="rotate-project-key" class="button">
+                  Rotate project key
+                </button>
               </p>
             </article>
             <article class="panel guide">
@@ -271,6 +289,65 @@
               >
             </article>
           </div>
+        </section>
+        <section id="view-operations" class="view" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">SERVICE HEALTH</p>
+              <h1>See trouble before it grows.</h1>
+              <p class="subtitle">
+                Project delivery health, instance storage, and active alerts.
+              </p>
+            </div>
+          </div>
+          <div id="health-metrics" class="metrics" aria-live="polite"></div>
+          <div class="quickstart-grid">
+            <article class="panel guide">
+              <h2>Storage & retention</h2>
+              <div id="storage-details"></div>
+              <p class="hint">
+                Cleanup preserves unfinished deliveries. Deleted SQLite pages
+                are reused; file size may stay unchanged.
+              </p>
+              <button id="preview-cleanup" class="button">
+                Preview cleanup
+              </button>
+              <div id="cleanup-result" aria-live="polite"></div>
+            </article>
+            <article class="panel guide">
+              <h2>Alerts</h2>
+              <p class="hint">
+                Alerts cover this instance. Notifications use the operator's
+                configured alert receiver.
+              </p>
+              <div id="alerts-list" aria-live="polite"></div>
+            </article>
+          </div>
+        </section>
+        <section id="view-recovery" class="view" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">OUTAGE RECOVERY</p>
+              <h1>Bring failures back into flow.</h1>
+              <p class="subtitle">
+                Preview up to 1,000 failed deliveries, then requeue them at a
+                controlled pace.
+              </p>
+            </div>
+            <button id="new-recovery" class="button primary">
+              Preview failures
+            </button>
+          </div>
+          <p class="hint">
+            Recovery progress counts deliveries requeued. Each delivery still
+            follows normal rate limits and retries. Cancelling stops the
+            remaining work; already queued deliveries continue.
+          </p>
+          <div
+            id="recovery-list"
+            class="endpoint-list"
+            aria-live="polite"
+          ></div>
         </section>
         <footer class="page-footer">
           <span>Built for the moments between send and received.</span

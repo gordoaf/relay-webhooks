@@ -5,7 +5,7 @@
 
 Relay is a self-hosted webhook delivery service. Send an event once, inspect every completed delivery attempt, and replay failures after fixing a receiver.
 
-It includes a delivery console, durable retries, project-scoped API keys, signed payloads, and a local failure-recovery lab. Python and SQLite run the service; the browser console has no build step.
+It includes a delivery console, durable retries, event subscriptions, credential rotation, bulk recovery, storage maintenance, and health monitoring. Python and TypeScript clients and a working storefront example demonstrate complete integrations. Python and SQLite run the service; the browser console has no build step.
 
 **[Try the interactive demo](https://gordoaf.github.io/relay-webhooks/)** · [Architecture](docs/architecture.md) · [API](docs/api.md) · [Operations](docs/operations.md)
 
@@ -96,7 +96,7 @@ curl -X POST http://127.0.0.1:8787/v1/events \
 
 An accepted event returns HTTP 202 after the event and its delivery rows commit together. Repeating the same request with the same idempotency key returns the original event with HTTP 200. Reusing a key for different content returns HTTP 409.
 
-Each enabled endpoint receives a signed JSON envelope:
+Each matching, enabled endpoint receives a signed JSON envelope:
 
 ```json
 {
@@ -118,15 +118,38 @@ Use `relay.delivery.verify_signature` against the **raw request bytes** before p
 | Retries | Six attempts per cycle; exponential backoff with jitter; bounded `Retry-After` support |
 | Signing | Standard Webhooks header/signature format with HMAC-SHA256 |
 | Isolation | Project keys ingest only into their own project; one instance administrator |
-| Destination controls | Per-endpoint rate limits and pause/resume |
+| Destination controls | Editable URLs and rate limits, pause/resume, exact or namespace event subscriptions |
+| Credential lifecycle | Project key and signing-secret rotation with an optional overlap up to 24 hours |
 | Failure isolation | Shared endpoint/project concurrency limits, fair scheduling, and timeout cooldowns |
-| Inspection | Search, status filters, pagination, attempt history, and manual replay |
+| Inspection | Search, status filters, pagination, per-attempt destination history, and manual replay |
+| Outage recovery | Frozen previews, paced bulk requeue, progress, and cancellation |
+| Operations | Queue metrics, authenticated Prometheus output, persistent alerts, signed alert notifications |
+| Storage | Opt-in bounded retention, post-purge idempotency protection, capacity admission |
+| Integration | Python and TypeScript clients, signature helpers, and a local storefront example |
 | Network boundaries | Public addresses by default, pinned DNS answers, no redirects, bounded time and response size |
 | Installation | Python package from this repository, or Docker Compose |
 
 Delivery is **at least once**. A receiver can process an event and lose its response before Relay records success; the event can then be delivered again. Receivers must deduplicate by event ID. Ordering is not guaranteed.
 
-Version 0.1 targets one host with local persistent storage. It does not provide multi-region availability, enterprise SSO, per-user permissions, or an uptime SLA. The administrator can access every project. Event retention is currently indefinite; budget disk space accordingly. See [the design boundaries](docs/architecture.md#boundaries).
+Version 0.2 targets one host with local persistent storage. It does not provide multi-region availability, enterprise SSO, per-user permissions, or an uptime SLA. The administrator can access every project. Automatic retention is disabled until configured. Enable a policy and monitor disk space for sustained use. See [the design boundaries](docs/architecture.md#boundaries).
+
+## Integrate and operate
+
+Follow the [integration guide](docs/integration.md) for Python and TypeScript clients and a complete storefront with separate warehouse and accounting receivers. Both clients preserve an explicit idempotency key across retries.
+
+In the console, **Endpoints** controls subscriptions and credential rotation; **Bulk recovery** previews failed deliveries before requeueing; **Health & storage** shows queue age, attempt failures, capacity, and alerts. The public browser demo simulates these workflows without sending real traffic.
+
+For an existing installation, retention is opt-in. A typical policy keeps completed history for 30 days and protects purged idempotency keys for another 90 days:
+
+```sh
+export RELAY_RETENTION_DAYS=30
+export RELAY_IDEMPOTENCY_DAYS=90
+relay cleanup          # Preview one bounded batch
+relay cleanup --apply  # Apply one batch
+relay status           # Queue, storage, policy, and alerts as JSON
+```
+
+Set these variables in your service environment (or `.env` for Compose) to apply them to automatic maintenance. See [operations](docs/operations.md) for Windows commands, storage limits, alerts, and upgrade precautions.
 
 ## Development
 
@@ -137,7 +160,15 @@ python -m pytest -q
 
 Tests cover competing claims, stale-lease rejection, restart recovery, atomic fanout, idempotency conflicts, authentication, project isolation, request limits, signature tampering, DNS pinning, redirects, slow receivers, and retry exhaustion. Hardening regressions exercise worker fairness, shared concurrency limits, DNS isolation, revocable sessions, proxy origins, malicious response headers, malformed Unicode, pagination bounds, migrations, and POSIX permissions. CI runs on Windows and Linux and checks the container's health, proxy login, and data permissions.
 
-Upgrading from 0.1.0 requires stopping all API and worker processes before the schema migration. Follow the [upgrade instructions](docs/operations.md#upgrade) and take a database backup first.
+Upgrading from 0.1.x requires stopping all API and worker processes before the schema migration. Follow the [upgrade instructions](docs/operations.md#upgrade) and take a database backup first.
+
+Check the full storefront flow against isolated real servers:
+
+```sh
+python scripts/check_storefront.py
+```
+
+For browser workflow checks, install `python -m pip install -e '.[ui]'`, run `python -m playwright install chromium`, then `python scripts/check_console.py`. These checks cover the live console and browser simulation, including mobile layout. The TypeScript client has a dependency-free suite: run `node --test` from `sdk/typescript`.
 
 Run the reproducible local delivery benchmark:
 

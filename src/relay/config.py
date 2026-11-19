@@ -1,5 +1,5 @@
-import os
 import ipaddress
+import os
 import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -78,9 +78,43 @@ class Settings:
     demo_mode: bool = False
     demo_receiver_port: int = 8790
     public_url: str = ""
+    retention_days: int = 0
+    idempotency_days: int = 90
+    cleanup_batch_size: int = 100
+    min_free_bytes: int = 0
+    max_storage_bytes: int = 0
+    storage_warning_percent: float = 90
+    queue_warning_age_seconds: int = 300
+    failure_warning_percent: float = 25
+    failure_min_samples: int = 10
+    alert_webhook_url: str = ""
+    alert_signing_secret: str = ""
+    alert_cooldown_seconds: int = 3600
+    maintenance_interval_seconds: float = 30
+    maintenance_enabled: bool = True
 
     def __post_init__(self):
         object.__setattr__(self, "public_url", public_origin(self.public_url))
+        self.operations_policy()
+
+    def operations_policy(self):
+        from .operations import OperationsPolicy
+
+        return OperationsPolicy(
+            retention_days=self.retention_days,
+            idempotency_days=self.idempotency_days,
+            cleanup_batch_size=self.cleanup_batch_size,
+            min_free_bytes=self.min_free_bytes,
+            max_storage_bytes=self.max_storage_bytes,
+            storage_warning_percent=self.storage_warning_percent,
+            queue_warning_age_seconds=self.queue_warning_age_seconds,
+            failure_warning_percent=self.failure_warning_percent,
+            failure_min_samples=self.failure_min_samples,
+            alert_webhook_url=self.alert_webhook_url or None,
+            alert_signing_secret=self.alert_signing_secret or None,
+            alert_cooldown_seconds=self.alert_cooldown_seconds,
+            interval_seconds=self.maintenance_interval_seconds,
+        )
 
     @classmethod
     def from_env(cls):
@@ -90,4 +124,20 @@ class Settings:
             allow_private_networks=env_bool("RELAY_ALLOW_PRIVATE_NETWORKS", False),
             worker_enabled=env_bool("RELAY_WORKER_ENABLED", True),
             public_url=os.getenv("RELAY_PUBLIC_URL", ""),
+            retention_days=int(os.getenv("RELAY_RETENTION_DAYS", "0")),
+            idempotency_days=int(os.getenv("RELAY_IDEMPOTENCY_DAYS", "90")),
+            cleanup_batch_size=int(os.getenv("RELAY_CLEANUP_BATCH_SIZE", "100")),
+            min_free_bytes=int(os.getenv("RELAY_MIN_FREE_BYTES", "0")),
+            max_storage_bytes=int(os.getenv("RELAY_MAX_STORAGE_BYTES", "0")),
+            storage_warning_percent=float(os.getenv("RELAY_STORAGE_WARNING_PERCENT", "90")),
+            queue_warning_age_seconds=int(os.getenv("RELAY_QUEUE_WARNING_AGE_SECONDS", "300")),
+            failure_warning_percent=float(os.getenv("RELAY_FAILURE_WARNING_PERCENT", "25")),
+            failure_min_samples=int(os.getenv("RELAY_FAILURE_MIN_SAMPLES", "10")),
+            alert_webhook_url=os.getenv("RELAY_ALERT_WEBHOOK_URL", ""),
+            alert_signing_secret=os.getenv("RELAY_ALERT_SIGNING_SECRET", ""),
+            alert_cooldown_seconds=int(os.getenv("RELAY_ALERT_COOLDOWN_SECONDS", "3600")),
+            maintenance_interval_seconds=float(
+                os.getenv("RELAY_MAINTENANCE_INTERVAL_SECONDS", "30")
+            ),
+            maintenance_enabled=env_bool("RELAY_MAINTENANCE_ENABLED", True),
         )

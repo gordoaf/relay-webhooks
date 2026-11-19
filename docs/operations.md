@@ -74,7 +74,21 @@ with sqlite3.connect("data/relay.db") as source:
 
 Backups include event data, receiver response excerpts, and signing secrets. Store them with restricted permissions. Restore into an isolated instance first; pending or expired processing rows can resume delivery when workers start.
 
-There is no automatic retention job in v0.1. Monitor disk growth and free space. Do not delete pending/processing records to reclaim space. A future retention command needs to preserve referential integrity and explicitly define idempotency expiration.
+Automatic retention is disabled by default. Set `RELAY_RETENTION_DAYS=30` to retain completed history for 30 days. An event becomes eligible only after its entire fanout is terminal and all of its deliveries have remained unchanged past the cutoff. Queued recovery members are protected. Cleanup removes bounded batches of attempts, deliveries, and then events; large histories may need several passes.
+
+The service preserves a hashed idempotency-key tombstone for `RELAY_IDEMPOTENCY_DAYS` (default 90) after an event is purged. During that window an identical submission returns HTTP 410 with the original event ID, and conflicting content returns 409. After expiry the key can create a new event. Unfinished events retain their original idempotency records regardless of age.
+
+Preview one batch before enabling automatic deletion on a running service:
+
+```powershell
+$env:RELAY_RETENTION_DAYS = '30'
+$env:RELAY_IDEMPOTENCY_DAYS = '90'
+relay cleanup
+relay cleanup --apply
+relay status
+```
+
+On macOS/Linux use `export RELAY_RETENTION_DAYS=30` and `export RELAY_IDEMPOTENCY_DAYS=90`, then the same commands. CLI commands use the process environment; `.env` is only loaded by Compose. Cleanup does not run VACUUM: SQLite reuses freed pages and the file need not shrink. Keep backups before deleting history. All API/worker processes sharing a database must use the same policy.
 
 ## Diagnose delivery failures
 
@@ -86,4 +100,47 @@ Application logs omit payloads and secrets. The console can show response excerp
 
 ## Upgrade
 
-For 0.1.1, back up the database and stop **all API and worker processes** before upgrading. The next startup atomically migrates schema 1 to schema 2, preserving projects, endpoints, events, and attempt history. The migration adds scheduler state, indexes, and revocable session records. Existing 0.1.0 browser cookies require a new login. Processes refuse newer unknown schema versions; do not run mixed application versions against the same database. To roll back, stop all processes and restore the pre-upgrade backup with the old application version.
+For 0.2.0, back up the database and stop **all API and worker processes** before upgrading. The next startup atomically migrates schema 1 or 2 to schema 3, preserving projects, endpoints, events, and attempt history. It adds subscriptions, credential overlap, recovery jobs, retention and monitoring state. Existing 0.1.1 sessions remain valid. Destination URLs in old attempt records stay unknown; new attempts record the claimed URL. Existing 0.1.0 browser cookies require a new login. Processes refuse newer unknown schema versions; do not run mixed application versions against the same database. To roll back, stop all processes and restore the pre-upgrade backup with the old application version.
+
+## Monitoring and alert delivery
+
+The console's Health & storage page and `relay status` expose queue depth/age, failures and mean attempt latency over the last hour, cooldown counts, disk usage, and alerts. `/metrics` exposes Prometheus gauges and requires administrator authentication. Keep it behind your monitoring network/access gateway; supply the admin token through your collector's secret mechanism.
+
+Alerts cover old unfinished work at enabled destinations, excessive recent failures, timeout cooldowns, and storage pressure. Paused endpoints contribute to queue age but do not trigger the delay alert. Alerts are persisted and visible without an outbound receiver. To receive notifications, configure both `RELAY_ALERT_WEBHOOK_URL` and `RELAY_ALERT_SIGNING_SECRET`. Generate a secret with:
+
+```sh
+python -c "import base64,secrets; print('whsec_' + base64.b64encode(secrets.token_bytes(32)).decode())"
+```
+
+The receiver gets a signed Standard Webhooks envelope of type `relay.alert.active` or `relay.alert.resolved`, containing an alert code, severity, message, and timestamps. Verify the raw body and deduplicate by webhook ID. The URL is used directly; services requiring proprietary message formats need an adapter. Neither event payloads nor credentials appear in alerts. Protect the receiver URL if it embeds an access token.
+
+Notifications use separate threads from event delivery, shared database leases, a five-second network deadline, at most three attempts per notification cycle, and cooldown reminders for active alerts. Network checks and redirect rejection match ordinary deliveries. They still share the host, database, and bounded resolver: use external monitoring for host failure, service downtime, or scrape failures. `/healthz` remains a basic process/database probe and does not promise queue freshness.
+
+## Maintenance configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RELAY_RETENTION_DAYS` | `0` | Completed history age; 0 disables deletion |
+| `RELAY_IDEMPOTENCY_DAYS` | `90` | Key protection after payload deletion; at least 1 day |
+| `RELAY_CLEANUP_BATCH_SIZE` | `100` | Per-table deletion bound per pass; 1-1000 |
+| `RELAY_MAINTENANCE_INTERVAL_SECONDS` | `30` | Maintenance polling interval |
+| `RELAY_MAINTENANCE_ENABLED` | `true` | Run maintenance and notification threads in API/worker processes |
+| `RELAY_MIN_FREE_BYTES` | `0` | Optional disk-space reserve for accepting new events |
+| `RELAY_MAX_STORAGE_BYTES` | `0` | Optional estimated used SQLite/WAL capacity ceiling |
+| `RELAY_STORAGE_WARNING_PERCENT` | `90` | Storage-pressure warning threshold |
+| `RELAY_QUEUE_WARNING_AGE_SECONDS` | `300` | Enabled destination queue-delay threshold |
+| `RELAY_FAILURE_WARNING_PERCENT` | `25` | Failed attempts in the last hour threshold |
+| `RELAY_FAILURE_MIN_SAMPLES` | `10` | Minimum recent attempts before failure-rate alerts |
+| `RELAY_ALERT_WEBHOOK_URL` | Unset | Optional operator notification destination |
+| `RELAY_ALERT_SIGNING_SECRET` | Unset | Paired `whsec_` secret for the notification receiver |
+| `RELAY_ALERT_COOLDOWN_SECONDS` | `3600` | Reminder interval for continuing active alerts |
+
+Capacity checks are conservative admission estimates, not filesystem quotas: attempt logs, administrative writes, and WAL behavior can still grow storage. A rejected event receives 503 before commit; existing idempotency reads remain available. Monitor free space externally as well. In Compose, these environment variables are forwarded from `.env`.
+
+## Endpoint maintenance and outage recovery
+
+Subscriptions affect new events only. URL edits affect future claims, including retries of older deliveries. In-flight requests finish using their claimed destination. Completed attempts retain the destination used; migrated pre-0.2 attempts display an unknown URL. Update receivers before changing destinations and do not assume edits cancel existing network requests.
+
+Use the console's rotation action to select an overlap window. Project-key rotation without a body stays immediate for older integrations. Only one previous credential is supported; a second rotation replaces it. A zero-second overlap revokes for future claims/authentication, while an already claimed delivery may still use its old signature.
+
+After fixing a receiver, use Bulk recovery to preview a destination/time window, select a requeue pace, and start. The preview freezes at most 1,000 failures. Progress counts released/skipped/cancelled members; delivery outcomes still follow ordinary retry rules. Cancel stops future releases but does not recall already queued work. Delivery workers must be running for jobs to progress.

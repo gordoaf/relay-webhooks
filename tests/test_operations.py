@@ -521,6 +521,148 @@ def test_failed_notification_does_not_allow_flapping_to_reset_rate_limit(store, 
     assert ops.list_alerts()[0]["notification_gate_until"] == 3700
 
 
+def test_stably_healthy_alert_rearms_across_restart_and_keeps_hourly_reminders(store, monkeypatch):
+    ops = alert_operations(store)
+    snapshot = quiet_snapshot(ops)
+    sent = []
+    monkeypatch.setattr(
+        module,
+        "deliver",
+        lambda url, body, *args, **kwargs: (
+            sent.append(json.loads(body)) or DeliveryResult(204, None, 1, "")
+        ),
+    )
+    snapshot["storage"]["disk_percent"] = 95
+    ops.evaluate_alerts(snapshot, now=100)
+    assert ops.notify_once(now=100)
+    snapshot["storage"]["disk_percent"] = 0
+    for stamp in range(130, 431, 30):
+        if stamp == 280:
+            reopened = Store(store.path)
+            reopened.initialize()
+            ops = alert_operations(reopened)
+        ops.evaluate_alerts(snapshot, now=stamp)
+        assert not ops.notify_once(now=stamp)
+    snapshot["storage"]["disk_percent"] = 95
+    ops.evaluate_alerts(snapshot, now=431)
+    assert ops.notify_once(now=431)
+    assert not ops.notify_once(now=4030)
+    assert ops.notify_once(now=4031)
+    assert [item["type"] for item in sent] == ["relay.alert.active"] * 3
+    assert len({item["id"] for item in sent}) == 3
+    assert sent[1]["data"]["first_seen_at"] == 431
+    assert ops.list_alerts()[0]["healthy_since"] is None
+
+
+@pytest.mark.parametrize("gap_while_healthy", [False, True])
+def test_alert_rearming_requires_recent_continuous_health_observations(
+    store, monkeypatch, gap_while_healthy
+):
+    ops = alert_operations(store)
+    snapshot = quiet_snapshot(ops)
+    monkeypatch.setattr(module, "deliver", lambda *args, **kwargs: DeliveryResult(204, None, 1, ""))
+    snapshot["storage"]["disk_percent"] = 95
+    ops.evaluate_alerts(snapshot, now=100)
+    assert ops.notify_once(now=100)
+    snapshot["storage"]["disk_percent"] = 0
+    for stamp in range(130, 431, 30):
+        ops.evaluate_alerts(snapshot, now=stamp)
+    recurrence = 500
+    if gap_while_healthy:
+        # A long monitoring gap starts a new observed healthy interval. The
+        # recurrence at800 does not prove health between the last sample and800.
+        for stamp in range(500, 771, 30):
+            ops.evaluate_alerts(snapshot, now=stamp)
+        assert ops.list_alerts()[0]["healthy_since"] == 500
+        recurrence = 800
+    snapshot["storage"]["disk_percent"] = 95
+    ops.evaluate_alerts(snapshot, now=recurrence)
+    assert not ops.notify_once(now=recurrence)
+    assert ops.list_alerts()[0]["notification_gate_until"] == 3700
+
+
+def test_new_incident_bypasses_just_sent_recovery_notice(store, monkeypatch):
+    ops = alert_operations(store, alert_cooldown_seconds=360, alert_rearm_seconds=60)
+    snapshot = quiet_snapshot(ops)
+    sent = []
+    monkeypatch.setattr(
+        module,
+        "deliver",
+        lambda url, body, *args, **kwargs: (
+            sent.append(json.loads(body)["type"]) or DeliveryResult(204, None, 1, "")
+        ),
+    )
+    snapshot["storage"]["disk_percent"] = 95
+    ops.evaluate_alerts(snapshot, now=100)
+    assert ops.notify_once(now=100)
+    snapshot["storage"]["disk_percent"] = 0
+    for stamp in (400, 430, 460):
+        ops.evaluate_alerts(snapshot, now=stamp)
+    assert ops.notify_once(now=460)
+    assert ops.list_alerts()[0]["notification_gate_until"] == 820
+    snapshot["storage"]["disk_percent"] = 95
+    ops.evaluate_alerts(snapshot, now=461)
+    assert ops.notify_once(now=461)
+    assert sent == ["relay.alert.active", "relay.alert.resolved", "relay.alert.active"]
+    assert ops.list_alerts()[0]["notification_gate_until"] == 821
+
+
+@pytest.mark.parametrize("old_result", ["success", "dns_capacity"])
+def test_rearmed_incident_fences_inflight_recovery_completion(store, monkeypatch, old_result):
+    ops = alert_operations(store, alert_cooldown_seconds=360)
+    other = alert_operations(Store(store.path), alert_cooldown_seconds=360)
+    snapshot = quiet_snapshot(ops)
+    entered, release = threading.Event(), threading.Event()
+
+    def sender(url, body, *args, **kwargs):
+        if json.loads(body)["type"] == "relay.alert.resolved":
+            entered.set()
+            assert release.wait(5)
+            if old_result == "dns_capacity":
+                return DeliveryResult(
+                    None, "Local capacity", 0, "", deferred_reason="dns_global_capacity"
+                )
+        return DeliveryResult(204, None, 1, "")
+
+    monkeypatch.setattr(module, "deliver", sender)
+    snapshot["storage"]["disk_percent"] = 95
+    ops.evaluate_alerts(snapshot, now=100)
+    assert ops.notify_once(now=100)
+    snapshot["storage"]["disk_percent"] = 0
+    for stamp in range(130, 461, 30):
+        ops.evaluate_alerts(snapshot, now=stamp)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        recovering = pool.submit(ops.notify_once, now=460)
+        assert entered.wait(5)
+        try:
+            snapshot["storage"]["disk_percent"] = 95
+            other.evaluate_alerts(snapshot, now=461)
+            assert other.notify_once(now=461)
+        finally:
+            release.set()
+        assert recovering.result()
+    alert = other.list_alerts()[0]
+    assert alert["active"] and alert["last_notified_at"] == 461
+    assert alert["last_notification_status"] == "delivered"
+    assert alert["notification_attempts"] == 0 and alert["notification_gate_until"] == 821
+    assert not other.notify_once(now=462)
+
+
+def test_stale_alert_snapshot_cannot_change_health_observations(store):
+    ops = alert_operations(store)
+    snapshot = quiet_snapshot(ops)
+    snapshot["storage"]["disk_percent"] = 95
+    ops.evaluate_alerts(snapshot, now=100)
+    snapshot["storage"]["disk_percent"] = 0
+    for stamp in (130, 160):
+        ops.evaluate_alerts(snapshot, now=stamp)
+    snapshot["storage"]["disk_percent"] = 95
+    ops.evaluate_alerts(snapshot, now=140)
+    alert = ops.list_alerts()[0]
+    assert not alert["active"]
+    assert alert["healthy_since"] == 130 and alert["last_observed_at"] == 160
+
+
 def test_notification_retry_claims_survive_sender_crashes(store, monkeypatch):
     ops = alert_operations(store)
     snapshot = quiet_snapshot(ops)
@@ -608,6 +750,37 @@ def test_operations_migrate_existing_schema3_alerts_without_resetting_state(stor
     migrated.evaluate_alerts(snapshot, now=110)
     assert not migrated.notify_once(now=110)
     assert migrated.list_alerts()[0]["next_notification_at"] == 3700
+
+
+def test_schema4_alert_migration_does_not_invent_observed_healthy_time(store, monkeypatch):
+    ops = alert_operations(store)
+    snapshot = quiet_snapshot(ops)
+    monkeypatch.setattr(module, "deliver", lambda *args, **kwargs: DeliveryResult(204, None, 1, ""))
+    snapshot["storage"]["disk_percent"] = 95
+    ops.evaluate_alerts(snapshot, now=100)
+    assert ops.notify_once(now=100)
+    snapshot["storage"]["disk_percent"] = 0
+    ops.evaluate_alerts(snapshot, now=130)
+    with store._db(True) as db:
+        db.execute("ALTER TABLE operation_alerts DROP COLUMN healthy_since")
+        db.execute("ALTER TABLE operation_alerts DROP COLUMN last_observed_at")
+        db.execute("PRAGMA user_version=4")
+    reopened = Store(store.path)
+    reopened.initialize()
+    migrated = alert_operations(reopened)
+    alert = migrated.list_alerts()[0]
+    assert not alert["active"] and alert["resolved_at"] == 130
+    assert alert["healthy_since"] is None and alert["last_observed_at"] is None
+    assert alert["last_notified_at"] == 100 and alert["notification_gate_until"] == 3700
+    snapshot["storage"]["disk_percent"] = 95
+    migrated.evaluate_alerts(snapshot, now=500)
+    assert not migrated.notify_once(now=500)
+    snapshot["storage"]["disk_percent"] = 0
+    for stamp in range(530, 831, 30):
+        migrated.evaluate_alerts(snapshot, now=stamp)
+    snapshot["storage"]["disk_percent"] = 95
+    migrated.evaluate_alerts(snapshot, now=831)
+    assert migrated.notify_once(now=831)
 
 
 def seed_terminal_history(store, project, endpoint, count):
@@ -765,6 +938,10 @@ def test_maintenance_lease_and_threads_do_not_take_delivery_slots(store):
         {"failure_min_samples": True},
         {"storage_warning_percent": float("nan")},
         {"queue_warning_age_seconds": float("inf")},
+        {"alert_rearm_seconds": 0},
+        {"alert_rearm_seconds": True},
+        {"alert_rearm_seconds": float("nan")},
+        {"alert_rearm_seconds": float("inf")},
         {"interval_seconds": 0},
         {"alert_webhook_url": "https://example.com"},
         {

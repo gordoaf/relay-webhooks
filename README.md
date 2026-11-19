@@ -120,7 +120,7 @@ Use `relay.delivery.verify_signature` against the **raw request bytes** before p
 | Isolation | Project keys ingest only into their own project; one instance administrator |
 | Destination controls | Editable URLs and rate limits, pause/resume, exact or namespace event subscriptions |
 | Credential lifecycle | Project key and signing-secret rotation with an optional overlap up to 24 hours |
-| Failure isolation | Shared concurrency and failing-probe limits, escalating cooldowns, project DNS allowances, and non-attempt capacity deferrals |
+| Failure isolation | Shared limits for slow and untested receivers, failing probes, escalating timeout cooldowns, project DNS allowances, and non-attempt capacity backoff |
 | Inspection | Search, status filters, pagination, per-attempt destination history, and manual replay |
 | Outage recovery | Frozen previews, paced bulk requeue, progress, and cancellation |
 | Operations | Queue and resource-pressure metrics, optional read-only Prometheus token, persisted alerts with flapping protection |
@@ -160,7 +160,7 @@ python -m pytest -q
 
 Tests cover competing claims, stale-lease rejection, restart recovery, atomic fanout, idempotency conflicts, authentication, project isolation, request limits, signature tampering, DNS pinning, redirects, slow receivers, and retry exhaustion. Hardening regressions exercise worker fairness, shared concurrency limits, DNS isolation, revocable sessions, proxy origins, malicious response headers, malformed Unicode, pagination bounds, migrations, and POSIX permissions. CI runs on Windows and Linux and checks the container's health, proxy login, and data permissions.
 
-Upgrading from 0.1.x or 0.2.0 requires stopping all API and worker processes before the schema migration. Follow the [upgrade instructions](docs/operations.md#upgrade) and take a database backup first.
+Upgrading from 0.1.x, 0.2.0, or 0.2.1 requires stopping all API and worker processes before the schema migration. Follow the [upgrade instructions](docs/operations.md#upgrade) and take a database backup first.
 
 Check the full storefront flow against isolated real servers:
 

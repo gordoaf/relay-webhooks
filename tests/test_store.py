@@ -149,6 +149,11 @@ def test_capacity_is_shared_between_processes(store, project, endpoint):
         store.create_endpoint(project["id"], f"https://other-{number}.example/", rate_limit=1000)
     for _ in range(4):
         store.create_event(project["id"], "queued", {})
+    with store._db(True) as db:
+        db.execute(
+            "UPDATE endpoints SET response_class='responsive',response_classified_at=?",
+            (time.time(),),
+        )
     with ProcessPoolExecutor(
         max_workers=4, mp_context=multiprocessing.get_context("spawn")
     ) as pool:
@@ -309,13 +314,146 @@ def test_v3_migration_adds_probe_and_deferral_state_without_changing_history(
         assert db.execute("SELECT lease_is_probe FROM deliveries").fetchone()[0] == 0
 
 
+def test_v4_migration_preserves_history_and_starts_responsiveness_unknown(store, project, endpoint):
+    submit(store, project)
+    job = store.claim_delivery()
+    assert finish(store, job)
+    store.create_event(project["id"], "processing", {})
+    with store._db(True) as db:
+        db.execute("UPDATE endpoints SET next_available_at=0")
+    in_flight = store.claim_delivery()
+    pending, _ = store.create_event(project["id"], "pending", {})
+    session_hash = hashlib.sha256(b"existing-session").hexdigest()
+    store.create_session(session_hash, time.time() + 3600)
+    with store._db(True) as db:
+        db.execute("DROP INDEX deliveries_processing_risky")
+        db.execute("DROP INDEX deliveries_processing_risky_project")
+        db.execute("ALTER TABLE deliveries DROP COLUMN lease_is_risky")
+        db.execute("ALTER TABLE endpoints DROP COLUMN response_class")
+        db.execute("ALTER TABLE endpoints DROP COLUMN response_classified_at")
+        db.execute("PRAGMA user_version=4")
+    store.initialize()
+    store.initialize()
+    state = store.list_endpoints(project["id"])[0]
+    assert state["response_class"] == "unknown" and state["response_classified_at"] == 0
+    assert store.delivery_detail(project["id"], job["id"])["attempts"][0]["status_code"] == 204
+    assert store.authenticate_project(project["api_key"])
+    assert store.valid_session(session_hash)
+    with store._db() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == module.SCHEMA_VERSION
+        retained = db.execute(
+            "SELECT status,lease_token,lease_is_risky FROM deliveries WHERE id=?",
+            (in_flight["id"],),
+        ).fetchone()
+        assert tuple(retained) == ("processing", in_flight["lease_token"], 0)
+        assert db.execute(
+            "SELECT status,attempt_count,lease_is_risky FROM deliveries WHERE event_id=?",
+            (pending["id"],),
+        ).fetchone()[:] == ("pending", 0, 0)
+
+
+def test_risk_capacity_is_shared_across_processes_and_reserves_responsive_work(store):
+    for index in range(4):
+        owner = store.create_project(f"Unknown {index}")
+        for target in range(2):
+            store.create_endpoint(
+                owner["id"], f"https://unknown-{index}-{target}.example/", rate_limit=1000
+            )
+        store.create_event(owner["id"], "test", {})
+    with ProcessPoolExecutor(
+        max_workers=4, mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        jobs = [job for job in pool.map(_claim_in_process, [store.path] * 8) if job]
+    assert len(jobs) == 3 and all(job["lease_is_risky"] == 1 for job in jobs)
+    assert len({job["project_id"] for job in jobs}) == 3
+    assert store.claim_delivery() is None
+    fast = store.create_project("Responsive")
+    ep = store.create_endpoint(fast["id"], "https://responsive.example/", rate_limit=1000)
+    store.create_event(fast["id"], "test", {})
+    with store._db(True) as db:
+        db.execute(
+            "UPDATE endpoints SET response_class='responsive',response_classified_at=? WHERE id=?",
+            (time.time(), ep["id"]),
+        )
+    ready = Store(store.path).claim_delivery()
+    assert ready["project_id"] == fast["id"] and ready["lease_is_risky"] == 0
+
+
+def test_cold_receiver_qualifies_after_risk_capacity_releases(store):
+    for index in range(3):
+        owner = store.create_project(f"Cold {index}")
+        store.create_endpoint(owner["id"], f"https://cold{index}.example/", rate_limit=1000)
+        store.create_event(owner["id"], "test", {})
+    jobs = [store.claim_delivery() for _ in range(3)]
+    healthy = store.create_project("New healthy receiver")
+    store.create_endpoint(healthy["id"], "https://healthy.example/", rate_limit=1000)
+    store.create_event(healthy["id"], "test", {})
+    assert store.claim_delivery() is None  # A cold destination is not yet known to be fast.
+    assert finish(store, jobs[0], 503, time.time() + 100)
+    next_job = store.claim_delivery()
+    assert next_job["project_id"] == healthy["id"] and next_job["lease_is_risky"] == 1
+    assert finish(store, next_job)
+    assert store.list_endpoints(healthy["id"])[0]["response_class"] == "responsive"
+
+
+def test_project_reserves_capacity_for_its_own_responsive_endpoint(store, project, endpoint):
+    submit(store, project)
+    assert finish(store, store.claim_delivery())
+    for index in range(3):
+        store.create_endpoint(project["id"], f"https://unknown{index}.example/", rate_limit=1000)
+    store.create_event(project["id"], "next", {})
+    with store._db(True) as db:
+        db.execute("UPDATE endpoints SET next_available_at=0")
+    first, second = store.claim_delivery(), store.claim_delivery()
+    assert first["endpoint_id"] != endpoint["id"] and first["lease_is_risky"] == 1
+    assert second["endpoint_id"] == endpoint["id"] and second["lease_is_risky"] == 0
+    assert store.claim_delivery() is None
+
+
+def test_responsiveness_expires_and_old_url_completion_cannot_classify_new_target(
+    store, project, endpoint, monkeypatch
+):
+    now = time.time()
+    monkeypatch.setattr(module.time, "time", lambda: now)
+    submit(store, project)
+    assert finish(store, store.claim_delivery())
+    store.create_event(project["id"], "next", {})
+    now += module.RESPONSIVE_SECONDS + 1
+    stale = store.claim_delivery(worker_concurrency=1)
+    assert stale["lease_is_risky"] == 1
+    updated = store.update_endpoint(
+        project["id"], endpoint["id"], url="https://replacement.example/"
+    )
+    assert updated["response_class"] == "unknown" and updated["response_classified_at"] == 0
+    assert finish(store, stale)
+    assert store.list_endpoints(project["id"])[0]["response_class"] == "unknown"
+    detail = store.delivery_detail(project["id"], stale["id"])
+    assert (
+        detail["status"] == "delivered" and detail["attempts"][0]["endpoint_url"] == endpoint["url"]
+    )
+
+
+def test_expired_risk_lease_releases_capacity_and_cannot_update_responsiveness(
+    store, project, endpoint
+):
+    submit(store, project)
+    old = store.claim_delivery(worker_concurrency=2)
+    with store._db(True) as db:
+        db.execute("UPDATE deliveries SET lease_expires_at=0")
+        db.execute("UPDATE endpoints SET next_available_at=0")
+    replacement = Store(store.path).claim_delivery(worker_concurrency=2)
+    assert replacement["id"] == old["id"] and replacement["lease_is_risky"] == 1
+    assert not finish(store, old)
+    assert store.list_endpoints(project["id"])[0]["response_class"] == "unknown"
+    assert finish(store, replacement)
+
+
 def test_unhealthy_project_cannot_occupy_all_capacity(store, project, endpoint):
     for number in range(6):
         store.create_endpoint(
             project["id"], f"https://unhealthy-{number}.example/", rate_limit=1000
         )
     store.create_event(project["id"], "slow", {})
-    assert store.claim_delivery()
     assert store.claim_delivery()
     assert store.claim_delivery() is None
     healthy = store.create_project("Healthy")

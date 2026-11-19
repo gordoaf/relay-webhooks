@@ -105,18 +105,30 @@ Relay database. If setup fails partway through, an incomplete project may remain
 in Relay; inspect it in the console before trying again.
 
 If you rotate a project key or signing secret in Relay, update the example's
-local credentials before the overlap expires. Set `RELAY_PROJECT_KEY` and/or
-`RELAY_WAREHOUSE_SIGNING_SECRET` / `RELAY_ACCOUNTING_SIGNING_SECRET` to the new
-values in a terminal, then run:
+local credentials before the overlap expires. Put the new value in an
+environment variable, then explicitly select its destination field. For example,
+after setting `RELAY_WAREHOUSE_SIGNING_SECRET` to the new warehouse secret:
 
 ```sh
-python examples/storefront/app.py credentials --resume-blocked
+python examples/storefront/app.py credentials --warehouse-secret-env RELAY_WAREHOUSE_SIGNING_SECRET
 ```
 
-The command validates and saves credentials without printing them. The running
-sender and receivers load the new values without a restart. `--resume-blocked`
-also makes blocked outbox records eligible to retry, retaining every original
-event payload and idempotency key. Remove the environment variables afterward.
+After setting `RELAY_PROJECT_KEY` to the rotated key for this storefront's project:
+
+```sh
+python examples/storefront/app.py credentials --project-key-env RELAY_PROJECT_KEY --resume-blocked
+```
+
+Use `--accounting-secret-env RELAY_ACCOUNTING_SIGNING_SECRET` for accounting.
+The three selectors can be combined, and each accepts any environment variable
+name. Only selected variables are read; unrelated exported credentials are
+ignored. At least one selector is required. Missing, empty, or invalid selected
+values reject the entire update without changing credentials or resuming work.
+
+The command prints the names of updated fields, never credential values. The
+running sender and receivers load the new values without a restart.
+`--resume-blocked` also makes blocked outbox records eligible to retry, retaining
+every original event payload and idempotency key. Remove the environment variables afterward.
 Use `--db` if your storefront has a different database path. The example never
 stores an administrator token or performs the rotation itself.
 

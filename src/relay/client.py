@@ -92,8 +92,10 @@ class RelayClient:
                     raise ValueError()
             else:
                 host = parts.hostname.encode("idna").decode("ascii").lower()
+                # Private DNS and Compose service names can contain underscores.
+                # Keep label lengths and origin boundaries strict after IDNA.
                 if len(host.rstrip(".")) > 253 or not all(
-                    re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                    re.fullmatch(r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?", label)
                     for label in host.removesuffix(".").split(".")
                 ):
                     raise ValueError()

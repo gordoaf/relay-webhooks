@@ -2,6 +2,7 @@ import base64
 import importlib.util
 import json
 import sqlite3
+import sys
 import threading
 from pathlib import Path
 
@@ -218,6 +219,155 @@ def test_invalid_credential_update_is_atomic_and_does_not_resume(storefront):
         storefront.update_credentials("new_project_key", {"warehouse": "invalid"}, True)
     assert storefront.config() == original
     assert storefront.state()["blocked_count"] == 2
+
+
+@pytest.mark.parametrize("service", ["warehouse", "accounting"])
+def test_credentials_cli_only_updates_selected_field_and_preserves_outbox(
+    storefront, monkeypatch, capsys, service
+):
+    storefront.order("Blocked", 1)
+    with storefront.db() as db:
+        db.execute("UPDATE outbox SET blocked=1")
+        original_events = [
+            tuple(row)
+            for row in db.execute("SELECT payload,idempotency_key FROM outbox ORDER BY id")
+        ]
+    original = storefront.config()
+    new_secret = "whsec_" + base64.b64encode(b"n" * 32).decode()
+    monkeypatch.setenv("RELAY_PROJECT_KEY", "unrelated_project_key")
+    monkeypatch.setenv("RELAY_WAREHOUSE_SIGNING_SECRET", "unrelated_warehouse_secret")
+    monkeypatch.setenv("RELAY_ACCOUNTING_SIGNING_SECRET", "unrelated_accounting_secret")
+    monkeypatch.setenv("SELECTED_RECEIVER_SECRET", new_secret)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "app.py",
+            "credentials",
+            "--db",
+            str(storefront.path),
+            f"--{service}-secret-env",
+            "SELECTED_RECEIVER_SECRET",
+            "--resume-blocked",
+        ],
+    )
+    example.main()
+    expected = {**original, "secrets": {**original["secrets"], service: new_secret}}
+    assert storefront.config() == expected
+    assert storefront.state()["blocked_count"] == 0
+    with storefront.db() as db:
+        assert [
+            tuple(row)
+            for row in db.execute("SELECT payload,idempotency_key FROM outbox ORDER BY id")
+        ] == original_events
+    output = capsys.readouterr()
+    assert output.out == (
+        f"Updated credential fields: {service} signing secret. "
+        "Resumed 2 blocked submissions with their original keys.\n"
+    )
+    assert output.err == ""
+
+
+def test_credentials_cli_explicit_project_key_ignores_receiver_environment(
+    storefront, monkeypatch, capsys
+):
+    original = storefront.config()
+    monkeypatch.setenv("SELECTED_PROJECT_KEY", "new_project_key")
+    monkeypatch.setenv("RELAY_PROJECT_KEY", "unrelated_project_key")
+    monkeypatch.setenv("RELAY_WAREHOUSE_SIGNING_SECRET", "invalid_unselected_secret")
+    monkeypatch.setenv("RELAY_ACCOUNTING_SIGNING_SECRET", "invalid_unselected_secret")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "app.py",
+            "credentials",
+            "--db",
+            str(storefront.path),
+            "--project-key-env",
+            "SELECTED_PROJECT_KEY",
+        ],
+    )
+    example.main()
+    assert storefront.config() == {**original, "api_key": "new_project_key"}
+    assert capsys.readouterr().out == (
+        "Updated credential fields: project API key. "
+        "Resumed 0 blocked submissions with their original keys.\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        [],
+        ["--warehouse-secret-env", "MISSING_SELECTED_SECRET"],
+        ["--warehouse-secret-env", "EMPTY_SELECTED_SECRET"],
+        [
+            "--project-key-env",
+            "NEW_SELECTED_KEY",
+            "--warehouse-secret-env",
+            "INVALID_SELECTED_SECRET",
+        ],
+    ],
+)
+def test_credentials_cli_errors_do_not_change_credentials_or_resume(
+    storefront, monkeypatch, capsys, options
+):
+    storefront.order("Blocked", 1)
+    with storefront.db() as db:
+        db.execute("UPDATE outbox SET blocked=1")
+        original_events = [tuple(row) for row in db.execute("SELECT * FROM outbox ORDER BY id")]
+    original = storefront.config()
+    monkeypatch.setenv("RELAY_PROJECT_KEY", "unrelated_project_key")
+    monkeypatch.setenv("RELAY_WAREHOUSE_SIGNING_SECRET", SECRET)
+    monkeypatch.delenv("MISSING_SELECTED_SECRET", raising=False)
+    monkeypatch.setenv("EMPTY_SELECTED_SECRET", "")
+    monkeypatch.setenv("NEW_SELECTED_KEY", "new_project_key")
+    monkeypatch.setenv("INVALID_SELECTED_SECRET", "invalid_signing_secret")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "app.py",
+            "credentials",
+            "--db",
+            str(storefront.path),
+            "--resume-blocked",
+            *options,
+        ],
+    )
+    with pytest.raises(SystemExit) as caught:
+        example.main()
+    assert caught.value.code == 2
+    assert storefront.config() == original
+    with storefront.db() as db:
+        assert [
+            tuple(row) for row in db.execute("SELECT * FROM outbox ORDER BY id")
+        ] == original_events
+    output = capsys.readouterr()
+    assert output.out == ""
+    for value in [SECRET, "unrelated_project_key", "new_project_key", "invalid_signing_secret"]:
+        assert value not in output.err
+
+
+def test_credentials_cli_rejects_selectors_on_other_commands(storefront, monkeypatch):
+    original = storefront.config()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "app.py",
+            "resume",
+            "--db",
+            str(storefront.path),
+            "--project-key-env",
+            "RELAY_PROJECT_KEY",
+        ],
+    )
+    with pytest.raises(SystemExit) as caught:
+        example.main()
+    assert caught.value.code == 2
+    assert storefront.config() == original
 
 
 def test_slow_outage_cannot_starve_later_orders_and_stop_interrupts_batch(storefront, monkeypatch):

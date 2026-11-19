@@ -4,6 +4,8 @@ Run: RELAY_SIGNING_SECRET=whsec_... python examples/receiver.py
 This example deliberately binds only to loopback.
 It admits at most eight connections and closes each request after ten seconds,
 including time spent waiting for headers. Use --port and --db to isolate runs.
+Overload gets a best-effort HTTP 503 with Retry-After before the socket closes;
+the accept loop never waits for the overloaded client to read the response.
 """
 
 import argparse
@@ -97,7 +99,7 @@ class ReceiverServer(ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         if not self._slots.acquire(blocking=False):
-            self.shutdown_request(request)
+            self._reject_overload(request)
             return
         request.settimeout(self.request_timeout)
         deadline = threading.Timer(self.request_timeout, self._expire, (request,))
@@ -110,6 +112,20 @@ class ReceiverServer(ThreadingHTTPServer):
         except Exception:
             self._release(request)
             raise
+
+    def _reject_overload(self, request):
+        # One nonblocking write, without a handler thread or HTTP parsing. A
+        # partial write or full socket buffer may still produce a plain close.
+        try:
+            request.setblocking(False)
+            request.send(
+                b"HTTP/1.1 503 Service Unavailable\r\n"
+                b"Content-Length: 0\r\nRetry-After: 1\r\nConnection: close\r\n\r\n"
+            )
+        except OSError:
+            pass
+        finally:
+            self.shutdown_request(request)
 
     def _release(self, request):
         with self._connection_lock:

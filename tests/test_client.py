@@ -185,6 +185,15 @@ def test_client_certificate_failure_is_not_retried_and_preserves_cause(monkeypat
         ("https://[2001:db8::2]", "2001:db8::2", 443),
         ("http://[::1]:8787", "::1", 8787),
         ("https://münich.example", "xn--mnich-kva.example", 443),
+        ("http://relay_api:8787", "relay_api", 8787),
+        ("https://RELAY_API.internal.", "relay_api.internal.", 443),
+        ("http://_relay_.internal", "_relay_.internal", 80),
+        ("http://" + "_" * 63, "_" * 63, 80),
+        (
+            "http://" + ".".join(["a" * 63] * 3 + ["b" * 61]),
+            ".".join(["a" * 63] * 3 + ["b" * 61]),
+            80,
+        ),
     ],
 )
 def test_client_normalizes_hostname_and_default_ports(url, host, port):
@@ -193,12 +202,51 @@ def test_client_normalizes_hostname_and_default_ports(url, host, port):
     assert (connection.host, connection.port) == (host, port)
 
 
+def test_client_reaches_underscore_service_name_with_original_host_header(monkeypatch):
+    hosts = []
+
+    def accept(handler, body):
+        hosts.append(handler.headers["Host"])
+        data = b'{"created":true,"event":{"id":"evt_private_dns"}}'
+        handler.send_response(202)
+        handler.send_header("Content-Length", str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
+
+    resolve = socket.getaddrinfo
+
+    def private_dns(host, port, *args, **kwargs):
+        assert host == "relay_api"
+        return resolve("127.0.0.1", port, *args, **kwargs)
+
+    with receiver(accept) as url:
+        monkeypatch.setattr(socket, "getaddrinfo", private_dns)
+        receipt = RelayClient(url.replace("127.0.0.1", "relay_api"), "project_key").emit(
+            "order.created", {}, idempotency_key="private_dns"
+        )
+        assert hosts == [url.removeprefix("http://").replace("127.0.0.1", "relay_api")]
+        assert receipt["event"]["id"] == "evt_private_dns"
+
+
 @pytest.mark.parametrize(
     "url",
     [
         "http://" + "a" * 64 + ".example",
+        "http://" + "_" * 64,
+        "http://" + ".".join(["a" * 63] * 3 + ["b" * 62]),
         "http://bad\ud800.example",
-        "http://bad_host.example",
+        "http://relay_api..internal",
+        "http://-relay_api.internal",
+        "http://relay_api-.internal",
+        "http://relay_api%2Finternal",
+        "http://relay_api\\internal",
+        "http://project_key@relay_api",
+        "http://relay_api/path",
+        "http://relay_api?token=value",
+        "http://relay_api#fragment",
+        "http://relay_api\x00.internal",
+        "http://relay_api\x7f.internal",
+        "http://[fe80::1%25eth0]",
         "http://example.com:0",
         "http://example.com:65536",
         "http://good.example\n.evil.example",

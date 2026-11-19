@@ -92,6 +92,7 @@ class Settings:
     alert_webhook_url: str = ""
     alert_signing_secret: str = ""
     alert_cooldown_seconds: int = 3600
+    alert_rearm_seconds: int = 300
     maintenance_interval_seconds: float = 30
     maintenance_enabled: bool = True
 
@@ -130,6 +131,7 @@ class Settings:
             alert_webhook_url=self.alert_webhook_url or None,
             alert_signing_secret=self.alert_signing_secret or None,
             alert_cooldown_seconds=self.alert_cooldown_seconds,
+            alert_rearm_seconds=self.alert_rearm_seconds,
             interval_seconds=self.maintenance_interval_seconds,
         )
 
@@ -155,6 +157,7 @@ class Settings:
             alert_webhook_url=os.getenv("RELAY_ALERT_WEBHOOK_URL", ""),
             alert_signing_secret=os.getenv("RELAY_ALERT_SIGNING_SECRET", ""),
             alert_cooldown_seconds=int(os.getenv("RELAY_ALERT_COOLDOWN_SECONDS", "3600")),
+            alert_rearm_seconds=int(os.getenv("RELAY_ALERT_REARM_SECONDS", "300")),
             maintenance_interval_seconds=float(
                 os.getenv("RELAY_MAINTENANCE_INTERVAL_SECONDS", "30")
             ),

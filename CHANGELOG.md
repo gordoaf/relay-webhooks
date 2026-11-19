@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2 - 2026-11-19
+
+- Reserve delivery capacity for recently responsive endpoints by bounding concurrent slow and untested destinations across workers and within each project. Successful slow responses remain delivered without retries or timeout penalties.
+- Back off DNS-capacity admission by affected scope before claiming more deliveries, reducing repeated queue writes while preserving retry budgets and operator resolver capacity.
+- Rearm notifications after continuously observed recovery, so fresh incidents can notify without waiting for an earlier incident's hourly reminder gate. Keep rapid flaps coalesced and persist recovery observations across brief restarts.
+- Require explicit environment-variable selectors when updating storefront credentials. Ignore unselected ambient values, validate updates atomically, and report changed field names without displaying secrets.
+- Restore Python client compatibility with underscore hostnames while retaining strict origin validation. Give overloaded example-receiver connections a best-effort nonblocking HTTP 503 response with `Retry-After`.
+- Clarify that failed-authentication HTTP 429 responses do not limit credential comparisons, including on the metrics route.
+- Add regression coverage and migrate schema 1/2/3/4 to 5. Back up and stop all old API/worker processes before upgrading; see the operations guide.
+
 ## 0.2.1 - 2026-11-19
 
 - Defer deliveries during local DNS capacity shortages without consuming retry attempts or penalizing destinations. Limit resolver ownership per project and reserve capacity for operator requests; expose persistent deferral counters.

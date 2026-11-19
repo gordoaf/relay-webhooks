@@ -6,6 +6,7 @@ import hmac
 import http.client
 import ipaddress
 import math
+import random
 from collections import OrderedDict
 import socket
 import ssl
@@ -21,6 +22,7 @@ _RESPONSE_SECONDS = 0.25
 _CONNECT_SECONDS = 3.0
 _DNS_SLOTS = threading.BoundedSemaphore(8)
 _DNS_LOCK = threading.Lock()
+_DNS_WAKE = threading.Condition(_DNS_LOCK)
 _DNS_INFLIGHT = {}
 _DNS_HOSTS = {}
 _DNS_PROJECT_COUNTS = {}
@@ -29,6 +31,9 @@ _DNS_DELIVERY_LIMIT = 6  # Two of the eight OS slots remain available to operato
 _DNS_FAILURES = OrderedDict()
 _DNS_CACHE_LIMIT = 256
 _DNS_FAILURE_SECONDS = 5.0
+_DNS_ADMISSION = OrderedDict()
+_DNS_ADMISSION_LIMIT = 64
+_DNS_ADMISSION_MAX_SECONDS = 5.0
 
 # Keep these exclusions explicit: ipaddress classifications differ between
 # supported Python patch versions. Transition mechanisms can route embedded
@@ -132,6 +137,82 @@ def _release_dns_slot(project_id):
         else:
             del _DNS_PROJECT_COUNTS[project_id]
     _DNS_SLOTS.release()
+    changed = False
+    if sum(_DNS_PROJECT_COUNTS.values()) < _DNS_DELIVERY_LIMIT:
+        changed = _DNS_ADMISSION.pop(None, None) is not None
+    if project_id is not None:
+        changed = _DNS_ADMISSION.pop(project_id, None) is not None or changed
+    if changed:
+        _DNS_WAKE.notify_all()
+
+
+def _capacity_unavailable(reason="dns_global_capacity", project_id=None):
+    # Called under _DNS_LOCK. Gates are process-local because OS resolver slots
+    # are process-local too. Never park another process's available resolver.
+    key = project_id if reason == "dns_project_capacity" else None
+    now = time.monotonic()
+    previous = _DNS_ADMISSION.get(key)
+    delay = (
+        min(_DNS_ADMISSION_MAX_SECONDS, previous[1] * 2)
+        if previous and now - previous[0] < 30
+        else 1.0
+    )
+    until = now + min(_DNS_ADMISSION_MAX_SECONDS, random.uniform(delay * 0.75, delay * 1.25))
+    _DNS_ADMISSION[key] = (until, delay)
+    _DNS_ADMISSION.move_to_end(key)
+    while len(_DNS_ADMISSION) > _DNS_ADMISSION_LIMIT:
+        _DNS_ADMISSION.popitem(last=False)
+    return DeliveryCapacityUnavailable(reason)
+
+
+def dns_admission_filter():
+    """Snapshot which endpoints can progress during local DNS backoff.
+
+    Literal IPs need no resolver; coalesced lookups and negative-cache results
+    need no new OS slot. A stale snapshot is harmless: _resolve still enforces
+    capacity and revalidates the addresses actually used for the connection.
+    """
+    with _DNS_LOCK:
+        now = time.monotonic()
+        for key, (until, _) in list(_DNS_ADMISSION.items()):
+            if now - until >= 30:
+                del _DNS_ADMISSION[key]
+        blocked = {key for key, (until, _) in _DNS_ADMISSION.items() if until > now}
+        if not blocked:
+            return None
+        reusable = set(_DNS_HOSTS) | {
+            host for host, (until, _) in _DNS_FAILURES.items() if until > now
+        }
+
+    def allowed(url, project_id):
+        if None not in blocked and project_id not in blocked:
+            return True
+        try:
+            host = (urlsplit(url).hostname or "").rstrip(".").encode("idna").decode("ascii").lower()
+        except (ValueError, UnicodeError):
+            # Let delivery record a permanent validation failure, rather than
+            # leaving malformed legacy configuration parked indefinitely.
+            return True
+        if host in reusable:
+            return True
+        try:
+            ipaddress.ip_address(host)
+            return True
+        except ValueError:
+            return False
+
+    return allowed
+
+
+def wait_for_dns_capacity(stopping, timeout):
+    with _DNS_WAKE:
+        if not stopping.is_set():
+            _DNS_WAKE.wait(timeout)
+
+
+def wake_dns_waiters():
+    with _DNS_WAKE:
+        _DNS_WAKE.notify_all()
 
 
 def _resolve(host, port, deadline, resolver_scope=None):
@@ -163,11 +244,11 @@ def _resolve(host, port, deadline, resolver_scope=None):
                 # the OS call ends, even if every caller has timed out.
                 if resolver_scope is not None:
                     if _DNS_PROJECT_COUNTS.get(resolver_scope, 0) >= _DNS_PROJECT_LIMIT:
-                        raise DeliveryCapacityUnavailable("dns_project_capacity")
+                        raise _capacity_unavailable("dns_project_capacity", resolver_scope)
                     if sum(_DNS_PROJECT_COUNTS.values()) >= _DNS_DELIVERY_LIMIT:
-                        raise DeliveryCapacityUnavailable()
+                        raise _capacity_unavailable()
                 if not _DNS_SLOTS.acquire(blocking=False):
-                    raise DeliveryCapacityUnavailable()
+                    raise _capacity_unavailable()
                 if resolver_scope is not None:
                     _DNS_PROJECT_COUNTS[resolver_scope] = (
                         _DNS_PROJECT_COUNTS.get(resolver_scope, 0) + 1
@@ -269,7 +350,14 @@ def _target(url, allow_private, deadline, resolver_scope=None):
         raise NetworkPolicyError("Invalid hostname")
     secure = parts.scheme == "https"
     port = port or (443 if secure else 80)
-    addresses = _resolve(host, port, deadline, resolver_scope)
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        addresses = _resolve(host, port, deadline, resolver_scope)
+    else:
+        family = socket.AF_INET if literal.version == 4 else socket.AF_INET6
+        sockaddr = (str(literal), port) if literal.version == 4 else (str(literal), port, 0, 0)
+        addresses = ((family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", sockaddr),)
     if not addresses:
         raise DNSResolutionError("Endpoint hostname has no addresses")
     for family, _, _, _, sockaddr in addresses:

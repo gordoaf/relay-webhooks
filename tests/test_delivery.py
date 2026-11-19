@@ -319,10 +319,14 @@ def test_public_addresses_still_allowed(address, monkeypatch):
 def isolated_dns(monkeypatch):
     monkeypatch.setattr(delivery_module, "_DNS_SLOTS", threading.BoundedSemaphore(8))
     monkeypatch.setattr(delivery_module, "_DNS_LOCK", threading.Lock())
+    monkeypatch.setattr(
+        delivery_module, "_DNS_WAKE", threading.Condition(delivery_module._DNS_LOCK)
+    )
     monkeypatch.setattr(delivery_module, "_DNS_INFLIGHT", {})
     monkeypatch.setattr(delivery_module, "_DNS_HOSTS", {})
     monkeypatch.setattr(delivery_module, "_DNS_PROJECT_COUNTS", {})
     monkeypatch.setattr(delivery_module, "_DNS_FAILURES", OrderedDict())
+    monkeypatch.setattr(delivery_module, "_DNS_ADMISSION", OrderedDict())
     yield
     deadline = time.monotonic() + 2
     while delivery_module._DNS_INFLIGHT and time.monotonic() < deadline:
@@ -525,3 +529,69 @@ def test_dns_start_failure_returns_project_and_global_capacity(monkeypatch, isol
     assert all(delivery_module._DNS_SLOTS.acquire(blocking=False) for _ in range(8))
     for _ in range(8):
         delivery_module._DNS_SLOTS.release()
+
+
+def test_dns_admission_backoff_is_scoped_bounded_and_preserves_reusable_answers(
+    monkeypatch, isolated_dns
+):
+    clock = [100.0]
+    monkeypatch.setattr(delivery_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(delivery_module.random, "uniform", lambda low, high: (low + high) / 2)
+    for expected in (1, 2, 4, 5, 5):
+        with delivery_module._DNS_LOCK:
+            delivery_module._capacity_unavailable("dns_project_capacity", "blocked")
+        until, _ = delivery_module._DNS_ADMISSION["blocked"]
+        assert until - clock[0] == expected
+        allowed = delivery_module.dns_admission_filter()
+        assert not allowed("https://new.example/", "blocked")
+        assert allowed("https://new.example/", "other")
+        assert allowed("http://8.8.8.8/", "blocked")
+        clock[0] = until + 0.01
+        assert delivery_module.dns_admission_filter() is None
+    with delivery_module._DNS_LOCK:
+        delivery_module._capacity_unavailable()
+        delivery_module._DNS_FAILURES["cached.example"] = (clock[0] + 20, False)
+        delivery_module._DNS_HOSTS["coalesced.example"] = delivery_module._DNSLookup()
+    allowed = delivery_module.dns_admission_filter()
+    assert allowed("https://cached.example/", "other")
+    assert allowed("https://coalesced.example/", "other")
+    assert allowed("http://[2606:4700:4700::1111]/", "other")
+    assert not allowed("https://fresh.example/", "other")
+    delivery_module._DNS_HOSTS.clear()
+    with delivery_module._DNS_LOCK:
+        for index in range(100):
+            delivery_module._capacity_unavailable("dns_project_capacity", f"project-{index}")
+    assert len(delivery_module._DNS_ADMISSION) == delivery_module._DNS_ADMISSION_LIMIT
+
+
+def test_control_lookup_release_cannot_reopen_saturated_delivery_gate(isolated_dns):
+    for _ in range(7):
+        assert delivery_module._DNS_SLOTS.acquire(blocking=False)
+    delivery_module._DNS_PROJECT_COUNTS.update({"p1": 2, "p2": 2, "p3": 2})
+    with delivery_module._DNS_LOCK:
+        delivery_module._capacity_unavailable()
+        delivery_module._release_dns_slot(None)
+    assert sum(delivery_module._DNS_PROJECT_COUNTS.values()) == 6
+    assert not delivery_module.dns_admission_filter()("https://new.example/", "new")
+    with delivery_module._DNS_LOCK:
+        delivery_module._release_dns_slot("p1")
+    assert delivery_module.dns_admission_filter() is None
+    with delivery_module._DNS_LOCK:
+        for project, count in list(delivery_module._DNS_PROJECT_COUNTS.items()):
+            for _ in range(count):
+                delivery_module._release_dns_slot(project)
+
+
+def test_literal_addresses_bypass_exhausted_dns_but_keep_network_policy(monkeypatch, isolated_dns):
+    def forbidden_lookup(*args, **kwargs):
+        raise AssertionError("Literal addresses must not enter DNS")
+
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden_lookup)
+    monkeypatch.setattr(delivery_module, "_DNS_SLOTS", threading.BoundedSemaphore(0))
+    validate_endpoint("https://8.8.8.8/")
+    validate_endpoint("https://[2606:4700:4700::1111]/")
+    for url in ("http://127.0.0.1/", "http://169.254.169.254/", "http://[::1]/"):
+        with pytest.raises(delivery_module.NetworkPolicyError, match="nonpublic"):
+            validate_endpoint(url)
+    target = delivery_module._target("http://127.0.0.1:8790/", True, time.monotonic() + 1)
+    assert target.addresses[0][-1] == ("127.0.0.1", 8790)

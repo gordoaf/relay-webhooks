@@ -6,7 +6,14 @@ import math
 import random
 import threading
 import time
-from .delivery import DeliveryResult, deliver, sign_headers
+from .delivery import (
+    DeliveryResult,
+    deliver,
+    dns_admission_filter,
+    sign_headers,
+    wait_for_dns_capacity,
+    wake_dns_waiters,
+)
 from .events import serialize_event
 
 logger = logging.getLogger(__name__)
@@ -43,7 +50,11 @@ class Worker:
 
     def run_once(self):
         released = self.store.advance_recoveries()
-        job = self.store.claim_delivery(lease_seconds=30)
+        job = self.store.claim_delivery(
+            lease_seconds=30,
+            worker_concurrency=self.concurrency,
+            endpoint_filter=dns_admission_filter(),
+        )
         if job is None:
             return bool(released)
         attempt = job["cycle_attempts"] + 1
@@ -129,7 +140,10 @@ class Worker:
                 logger.exception("Worker cycle failed; unfinished leases will expire")
                 worked = False
             if not worked:
-                self._stopping.wait(self.poll_interval)
+                if dns_admission_filter() is not None:
+                    wait_for_dns_capacity(self._stopping, min(self.poll_interval, 0.5))
+                else:
+                    self._stopping.wait(self.poll_interval)
 
     def start(self):
         with self._lifecycle:
@@ -146,6 +160,7 @@ class Worker:
     def stop(self):
         with self._lifecycle:
             self._stopping.set()
+            wake_dns_waiters()
             for thread in self._threads:
                 if thread is not threading.current_thread():
                     thread.join()

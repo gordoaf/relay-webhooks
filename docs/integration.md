@@ -127,4 +127,7 @@ in Python or `eventId` in JavaScript and `accepted` set to true. Keep the origin
 key and event ID; do not turn this response into a new submission with another key.
 The storefront records this acceptance separately from receiver fulfillment.
 Its recovery controls let you update credentials and explicitly resume blocked
-outbox entries while preserving their original keys; see the walkthrough.
+outbox entries while preserving their original keys. Credential updates require
+explicit field selectors such as `--warehouse-secret-env RELAY_WAREHOUSE_SIGNING_SECRET`;
+unselected environment variables are ignored. See the walkthrough for combined
+updates and project-key rotation.

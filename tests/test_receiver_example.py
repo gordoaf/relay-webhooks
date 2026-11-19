@@ -10,6 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from pathlib import Path
 
+import pytest
+
 from relay.delivery import sign_headers
 
 spec = importlib.util.spec_from_file_location(
@@ -64,18 +66,61 @@ def test_idle_connection_does_not_block_healthy_delivery_and_expires(tmp_path):
 
 
 def test_receiver_connection_concurrency_is_bounded(tmp_path):
-    with running_receiver(tmp_path, max_connections=2, request_timeout=5) as server:
-        sockets = [socket.create_connection(server.server_address, timeout=2) for _ in range(2)]
+    with running_receiver(tmp_path, request_timeout=5) as server:
+        sockets = [socket.create_connection(server.server_address, timeout=2) for _ in range(8)]
         try:
-            wait_for(lambda: len(server._connections) == 2)
+            wait_for(lambda: len(server._connections) == 8)
+            started = time.monotonic()
             with socket.create_connection(server.server_address, timeout=2) as extra:
-                assert extra.recv(1) == b""
-            assert len(server._connections) == 2
+                # Admission rejects before reading headers. Read the early
+                # response directly; clients still writing may see a reset.
+                response = http.client.HTTPResponse(extra)
+                response.begin()
+                assert response.status == 503
+                assert response.getheader("Retry-After") == "1"
+                assert response.getheader("Connection") == "close"
+                assert response.read() == b""
+            assert time.monotonic() - started < 1
+            assert len(server._connections) == 8
         finally:
             for connection in sockets:
                 connection.close()
         wait_for(lambda: not server._connections)
         assert deliver(server) == 204
+
+
+@pytest.mark.parametrize("write_result", [1, BlockingIOError(), ConnectionResetError()])
+def test_overload_never_waits_or_retries_a_partial_response(tmp_path, write_result):
+    class CongestedSocket:
+        def __init__(self):
+            self.calls = []
+
+        def setblocking(self, value):
+            self.calls.append(("blocking", value))
+
+        def send(self, body):
+            self.calls.append(("send", body))
+            if isinstance(write_result, OSError):
+                raise write_result
+            return write_result
+
+        def shutdown(self, how):
+            self.calls.append(("shutdown", how))
+
+        def close(self):
+            self.calls.append(("close",))
+
+    with running_receiver(tmp_path, max_connections=1) as server:
+        assert server._slots.acquire(blocking=False)
+        connection = CongestedSocket()
+        try:
+            server.process_request(connection, ("127.0.0.1", 12345))
+        finally:
+            server._slots.release()
+        assert [call[0] for call in connection.calls] == ["blocking", "send", "shutdown", "close"]
+        assert connection.calls[0] == ("blocking", False)
+        assert b"503 Service Unavailable" in connection.calls[1][1]
+        assert server._connections == {}
 
 
 def test_receiver_deadline_stops_headers_that_keep_trickling(tmp_path):

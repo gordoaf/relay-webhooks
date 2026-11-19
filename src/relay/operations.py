@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS operation_alerts (
  lease_token TEXT, lease_expires_at REAL, last_notified_at REAL,
  last_notification_status TEXT, notification_cycle INTEGER NOT NULL DEFAULT 0,
  notification_gate_until REAL NOT NULL DEFAULT 0,
- notification_version INTEGER NOT NULL DEFAULT 0
+ notification_version INTEGER NOT NULL DEFAULT 0,
+ healthy_since REAL, last_observed_at REAL
 );
 CREATE TABLE IF NOT EXISTS operation_leases (
  name TEXT PRIMARY KEY, token TEXT NOT NULL, expires_at REAL NOT NULL
@@ -64,6 +65,8 @@ def initialize_operations(db):
     for name, definition in {
         "notification_gate_until": "REAL NOT NULL DEFAULT 0",
         "notification_version": "INTEGER NOT NULL DEFAULT 0",
+        "healthy_since": "REAL",
+        "last_observed_at": "REAL",
     }.items():
         if name not in existing:
             db.execute(f"ALTER TABLE operation_alerts ADD COLUMN {name} {definition}")
@@ -126,6 +129,7 @@ class OperationsPolicy:
     alert_webhook_url: str | None = None
     alert_signing_secret: str | None = None
     alert_cooldown_seconds: float = 3600
+    alert_rearm_seconds: float = 300
     interval_seconds: float = 30
 
     def __post_init__(self):
@@ -149,7 +153,12 @@ class OperationsPolicy:
             value = getattr(self, name)
             if isinstance(value, bool) or not math.isfinite(value) or not 0 < value <= 100:
                 raise ValueError(f"{name} must be greater than 0 and at most 100")
-        for name in ("queue_warning_age_seconds", "alert_cooldown_seconds", "interval_seconds"):
+        for name in (
+            "queue_warning_age_seconds",
+            "alert_cooldown_seconds",
+            "alert_rearm_seconds",
+            "interval_seconds",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not math.isfinite(value) or value < 1:
                 raise ValueError(f"{name} must be finite and at least 1 second")
@@ -602,7 +611,7 @@ class Operations:
             rows = db.execute(
                 """SELECT code,severity,active,message,first_seen_at,updated_at,resolved_at,
                 last_notified_at,notification_attempts,last_notification_status,
-                notification_gate_until,next_notification_at
+                notification_gate_until,next_notification_at,healthy_since,last_observed_at
                 FROM operation_alerts ORDER BY active DESC,code"""
             ).fetchall()
         return [{**dict(row), "active": bool(row["active"])} for row in rows]
@@ -656,24 +665,51 @@ class Operations:
                 if previous is None:
                     if active:
                         db.execute(
-                            """INSERT INTO operation_alerts(code,severity,active,message,first_seen_at,updated_at,next_notification_at)
-                            VALUES(?,?,1,?,?,?,?)""",
-                            (code, severity, message, now, now, now),
+                            """INSERT INTO operation_alerts(code,severity,active,message,first_seen_at,updated_at,
+                            next_notification_at,last_observed_at) VALUES(?,?,1,?,?,?,?,?)""",
+                            (code, severity, message, now, now, now, now),
                         )
-                elif bool(previous["active"]) != active:
-                    # Keep the send gate across versions. A flapping condition
-                    # updates dashboard state immediately and replaces its queued
-                    # notification, without opening another notification cycle.
-                    gate = max(
-                        previous["notification_gate_until"],
-                        (previous["last_notified_at"] or 0) + self.policy.alert_cooldown_seconds
-                        if previous["last_notified_at"] is not None
-                        else 0,
+                    continue
+                observed = previous["last_observed_at"]
+                if observed is not None and now < observed:
+                    # A delayed snapshot must not undo a newer state or extend
+                    # an apparently healthy period using out-of-order evidence.
+                    continue
+                continuous = observed is not None and now - observed <= 2 * policy.interval_seconds
+                healthy_since = None
+                if not active:
+                    healthy_since = (
+                        previous["healthy_since"]
+                        if not previous["active"]
+                        and continuous
+                        and previous["healthy_since"] is not None
+                        else now
+                    )
+                if bool(previous["active"]) != active:
+                    rearmed = (
+                        active
+                        and continuous
+                        and previous["healthy_since"] is not None
+                        and observed - previous["healthy_since"] >= policy.alert_rearm_seconds
+                    )
+                    # Rapid transitions keep their gate. A newly active incident
+                    # after observed stable health bypasses even a just-sent
+                    # recovery notice; the next claim reserves a fresh cooldown.
+                    gate = (
+                        now
+                        if rearmed
+                        else max(
+                            previous["notification_gate_until"],
+                            (previous["last_notified_at"] or 0) + policy.alert_cooldown_seconds
+                            if previous["last_notified_at"] is not None
+                            else 0,
+                        )
                     )
                     db.execute(
                         """UPDATE operation_alerts SET active=?,message=?,first_seen_at=?,updated_at=?,resolved_at=?,
                         version=version+1,notification_cycle=0,notification_attempts=0,next_notification_at=?,lease_token=NULL,
-                        lease_expires_at=NULL,last_notification_status=NULL WHERE code=?""",
+                        lease_expires_at=NULL,last_notification_status=NULL,notification_gate_until=?,
+                        healthy_since=?,last_observed_at=? WHERE code=?""",
                         (
                             int(active),
                             message,
@@ -681,8 +717,16 @@ class Operations:
                             now,
                             None if active else now,
                             max(now, gate),
+                            gate,
+                            healthy_since,
+                            now,
                             code,
                         ),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE operation_alerts SET healthy_since=?,last_observed_at=? WHERE code=?",
+                        (healthy_since, now, code),
                     )
 
     def notify_once(self, now=None):

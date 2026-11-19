@@ -27,9 +27,9 @@ uvicorn relay.app:create_app --factory --host 127.0.0.1 --port 8787 \
 
 Never use `--forwarded-allow-ips='*'` on a backend reachable by untrusted clients. `RELAY_PUBLIC_URL` does not establish trust in forwarded client addresses.
 
-Keep the console and administrative API behind your private network or access gateway. Allow public access to event ingestion only when required. Add connection limits and request-rate limits at the proxy. The built-in failed-authentication throttle covers login and administrator bearer authentication, is bounded and per process, and does not reject valid credentials because another client used up the failure allowance. It is not distributed request-rate protection. Always generate the administrator token randomly; the length check cannot establish that a manually chosen token is unpredictable.
+Keep the console and administrative API behind your private network or access gateway. Allow public access to event ingestion only when required. Add connection limits and request-rate limits at the proxy. The built-in failed-authentication throttle covers login, administrator bearer authentication, and metrics bearer authentication, is bounded and per process, and does not reject valid credentials because another client used up the failure allowance. It is not distributed request-rate protection. Always generate tokens randomly; the length check cannot establish that a manually chosen token is unpredictable.
 
-The application checks credentials before returning a failure-limit response. This prevents anonymous lockout but does **not cap credential comparisons**. Enforce the request ceiling before requests reach Relay. For example, with Nginx receiving client connections directly, declare a zone in the `http` context and apply it inside your existing TLS server:
+The application checks credentials before returning a failure-limit response, including on `/metrics`. HTTP 429 therefore does **not cap credential comparisons** or independently prevent token guessing. Enforce the request ceiling before requests reach Relay, including the metrics route. For example, with Nginx receiving client connections directly, declare a zone in the `http` context and apply it inside your existing TLS server:
 
 ```nginx
 # In http {}:
@@ -37,6 +37,15 @@ limit_req_zone $binary_remote_addr zone=relay_admin:10m rate=5r/s;
 
 # In the configured TLS server {}:
 location /api/ {
+    limit_req zone=relay_admin burst=20 nodelay;
+    limit_req_status 429;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_pass http://127.0.0.1:8787;
+}
+
+location = /metrics {
     limit_req zone=relay_admin burst=20 nodelay;
     limit_req_status 429;
     proxy_set_header Host $http_host;
@@ -58,9 +67,15 @@ On POSIX systems, Relay creates its data directory with mode 0700 and restricts 
 
 Set `RELAY_WORKER_ENABLED=false` for the API and run `relay worker` with the same database path, administrator configuration, and destination policy. Multiple processes on the same host can claim work safely. All must use a local filesystem and the same configuration. This is not a multi-host database setup.
 
-The scheduler allows one active delivery per endpoint and two per project by default, counted from unexpired leases across processes. It alternates eligible projects and endpoints. After the first timeout, that endpoint's next claims share a single instance-wide probe allowance with other timing-out endpoints. With multiple worker threads, known failing destinations cannot occupy every delivery slot. Initially unknown failures can still occupy slots until their first timeout; a single worker cannot reserve separate healthy capacity. Three consecutive timeouts start a 30-second cooldown, then 60, 120, 240, 480, and at most 600 seconds on further timeouts. A non-timeout result resets the streak. Endpoint rate limits still apply.
+The scheduler allows one active delivery per endpoint and two per project by default, counted from unexpired leases across processes. It alternates eligible projects and endpoints. An attempt taking at least five seconds marks an endpoint slow, even if the receiver closes without returning HTTP. An HTTP response under five seconds qualifies for responsive capacity. Classification expires after 15 minutes; new or unclassified endpoints use the untested lane. Slow, untested, and timing-out endpoints together may use at most one slot per project and `max(1, RELAY_WORKER_CONCURRENCY - 1)` slots across the database. This leaves a slot for recently responsive destinations when concurrency is at least two. All processes sharing a database must use the same concurrency setting.
 
-DNS lookups for the same hostname are coalesced and failures have a short bounded cache. Each process allows eight outstanding operating-system lookups, with at most two owned by one delivery project and six owned by delivery work altogether. The remaining capacity is available to endpoint validation and operator notifications. Caller timeouts do not release slots until the underlying OS lookup finishes. Local capacity shortages defer deliveries with jitter without recording a failed attempt, consuming retry budget, or extending endpoint cooldowns. The actual destination's DNS timeout still counts as a failed attempt. Distinct stalled names across projects can exhaust delivery capacity; use a reliable local resolver and monitor capacity deferrals. These per-process bounds are not a host-wide DNS quota.
+The reserve is intentional: with four workers, an entirely slow or untested workload can initially use at most three slots, and each affected project can use only one. A single worker cannot reserve separate responsive capacity. A brand-new healthy destination must first pass through the bounded untested lane, so its first response can wait behind earlier claims. A previously responsive receiver can also fail on its next request. These limits reduce interference; they do not guarantee latency during every outage. URL changes require the new target to qualify again. A slow HTTP 2xx response remains delivered, with no retry or timeout penalty solely because it was slow.
+
+After the first timeout, that endpoint's next claims additionally share a single instance-wide probe allowance with other timing-out endpoints. Three consecutive timeouts start a 30-second cooldown, then 60, 120, 240, 480, and at most 600 seconds on further timeouts. A non-timeout result resets the streak. Endpoint rate limits still apply.
+
+DNS lookups for the same hostname are coalesced and failures have a short bounded cache. Each process allows eight outstanding operating-system lookups, with at most two owned by one delivery project and six owned by delivery work altogether. The remaining capacity is available to endpoint validation and operator notifications. Caller timeouts do not release slots until the underlying OS lookup finishes. Local capacity shortages defer deliveries without recording a failed attempt, consuming retry budget, or extending endpoint cooldowns. After a capacity deferral, admission backs off at the affected project or global scope before claiming more work that needs a new lookup. The delay grows from one to five seconds with jitter and clears when resolver capacity is released. Numeric destinations and reusable hostname lookups remain eligible; project pressure does not pause unrelated projects. This limits repeated claims and queue writes during sustained resolver pressure.
+
+The actual destination's DNS timeout still counts as a failed attempt. Distinct stalled names across projects can exhaust delivery capacity; use a reliable local resolver and monitor capacity deferrals. These per-process bounds are not a host-wide DNS quota, and admission backoff cannot cancel an operating-system DNS lookup.
 
 ## Backups and retention
 
@@ -104,7 +119,7 @@ Application logs omit payloads and secrets. The console can show response excerp
 
 ## Upgrade
 
-For 0.2.1, back up the database and stop **all API and worker processes** before upgrading. The next startup atomically migrates schema 1, 2, or 3 to schema 4, preserving projects, endpoints, events, and attempt history. The new migration adds shared failure-probe accounting, DNS deferral counters, and notification throttling state. Existing 0.1.1/0.2.0 sessions remain valid. Destination URLs in pre-0.2 attempt records stay unknown; new attempts record the claimed URL. Existing 0.1.0 browser cookies require a new login. Processes refuse newer unknown schema versions; do not run mixed application versions against the same database. To roll back, stop all processes and restore the pre-upgrade backup with the old application version. Retention remains opt-in. Existing accepted events keep their idempotency semantics; the new serialized-size limit applies to new acceptance and does not rewrite historical payloads.
+For 0.2.2, back up the database and stop **all API and worker processes** before upgrading. The next startup atomically migrates schema 1, 2, 3, or 4 to schema 5, preserving projects, endpoints, events, and attempt history. This migration adds endpoint responsiveness, shared claim accounting, and observed alert-recovery state. Endpoints qualify for responsive capacity through new attempts after migration. Existing 0.1.1/0.2.x sessions remain valid. Destination URLs in pre-0.2 attempt records stay unknown; new attempts record the claimed URL. Existing 0.1.0 browser cookies require a new login. Processes refuse newer unknown schema versions; do not run mixed application versions against the same database. To roll back, stop all processes and restore the pre-upgrade backup with the old application version. Retention remains opt-in. Existing accepted events keep their idempotency semantics; serialized-size limits apply to new acceptance and do not rewrite historical payloads.
 
 ## Monitoring and alert delivery
 
@@ -118,7 +133,11 @@ python -c "import base64,secrets; print('whsec_' + base64.b64encode(secrets.toke
 
 The receiver gets a signed Standard Webhooks envelope of type `relay.alert.active` or `relay.alert.resolved`, containing an alert code, severity, message, and timestamps. Verify the raw body and deduplicate by webhook ID. The URL is used directly; services requiring proprietary message formats need an adapter. Neither event payloads nor credentials appear in alerts. Protect the receiver URL if it embeds an access token.
 
-Notifications use separate threads from event delivery, shared database leases, a five-second network deadline, and at most three attempts per notification cycle. The cooldown now spans active/resolved transitions for each alert code: the dashboard updates immediately, while pending notifications coalesce to the latest state until the gate opens. This limits flapping but can delay recovery notices by the configured cooldown. Retries of the same notification keep their bounded 30/60-second backoff; continuing active alerts receive cooldown reminders. Network checks and redirect rejection match ordinary deliveries. Notifications have access to reserved resolver capacity but still share the host and database: use external monitoring for host failure, service downtime, or scrape failures. `/healthz` remains a basic process/database probe and does not promise queue freshness.
+Notifications use separate threads from event delivery, shared database leases, a five-second network deadline, and at most three attempts per notification cycle. Rapid active/resolved transitions for each alert code coalesce to the latest state until its cooldown gate opens; the dashboard updates immediately. Continuing active alerts receive cooldown reminders, and recovery notices can wait for that same gate. Retries of the same notification keep their bounded 30/60-second backoff.
+
+After continuously observed healthy conditions for `RELAY_ALERT_REARM_SECONDS` (default five minutes), a fresh active incident can notify immediately even if a recovery notice was just sent. The healthy interval is persisted across brief restarts. A monitoring gap longer than twice the maintenance interval resets it; Relay does not infer health while monitoring is absent. Migrated alerts establish a new observation interval. This rearming leaves rapid flaps coalesced and continuing-incident reminders on `RELAY_ALERT_COOLDOWN_SECONDS` (default one hour).
+
+Network checks and redirect rejection match ordinary deliveries. Notifications have access to reserved resolver capacity but still share the host and database: use external monitoring for host failure, service downtime, or scrape failures. `/healthz` remains a basic process/database probe and does not promise queue freshness.
 
 ## Maintenance configuration
 
@@ -138,6 +157,7 @@ Notifications use separate threads from event delivery, shared database leases, 
 | `RELAY_ALERT_WEBHOOK_URL` | Unset | Optional operator notification destination |
 | `RELAY_ALERT_SIGNING_SECRET` | Unset | Paired `whsec_` secret for the notification receiver |
 | `RELAY_ALERT_COOLDOWN_SECONDS` | `3600` | Per-code notification-cycle gate across transitions and active reminders |
+| `RELAY_ALERT_REARM_SECONDS` | `300` | Continuously observed healthy time before a new incident can bypass the notification gate; at least 1 second |
 
 Capacity checks are conservative admission estimates, not filesystem quotas: attempt logs, administrative writes, and WAL behavior can still grow storage. A rejected event receives 503 before commit; existing idempotency reads remain available. Monitor free space externally as well. In Compose, these environment variables are forwarded from `.env`.
 

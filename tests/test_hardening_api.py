@@ -1,4 +1,4 @@
-"""Admission and monitoring regressions from the second adversarial review."""
+"""Admission and monitoring regressions from adversarial review."""
 
 import pytest
 from fastapi.testclient import TestClient
@@ -159,6 +159,20 @@ def test_worker_and_metrics_environment(monkeypatch, tmp_path):
     for invalid in ("short", ADMIN, " " * 40):
         with pytest.raises(ValueError, match="METRICS_TOKEN"):
             settings(tmp_path, metrics_token=invalid)
+
+
+def test_alert_rearm_configuration_reaches_operations_api(monkeypatch, tmp_path):
+    monkeypatch.setenv("RELAY_ALERT_REARM_SECONDS", "600")
+    config = Settings.from_env()
+    assert config.alert_rearm_seconds == 600
+    assert config.operations_policy().alert_rearm_seconds == 600
+    with TestClient(create_app(settings(tmp_path, alert_rearm_seconds=600))) as client:
+        response = client.get("/api/operations", headers={"Authorization": "Bearer " + ADMIN})
+        assert response.status_code == 200
+        assert response.json()["policy"]["alert_rearm_seconds"] == 600
+    for invalid in (0, -1, True, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="alert_rearm_seconds"):
+            settings(tmp_path, alert_rearm_seconds=invalid)
 
 
 def test_endpoint_validation_reports_temporary_resolver_pressure(tmp_path, monkeypatch):

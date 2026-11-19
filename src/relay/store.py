@@ -51,10 +51,16 @@ CREATE INDEX IF NOT EXISTS deliveries_event ON deliveries(event_id);
 CREATE INDEX IF NOT EXISTS endpoints_project ON endpoints(project_id);
 CREATE INDEX IF NOT EXISTS attempts_delivery ON attempts(delivery_id,attempt_number);
 """
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+SLOW_RESPONSE_MS = 5000
+RESPONSIVE_SECONDS = 900
 AVAILABILITY_SCHEMA = """
 CREATE INDEX IF NOT EXISTS deliveries_processing_probes ON deliveries(lease_expires_at)
  WHERE status='processing' AND lease_is_probe=1;
+CREATE INDEX IF NOT EXISTS deliveries_processing_risky ON deliveries(lease_expires_at)
+ WHERE status='processing' AND lease_is_risky=1;
+CREATE INDEX IF NOT EXISTS deliveries_processing_risky_project ON deliveries(project_id,lease_expires_at)
+ WHERE status='processing' AND lease_is_risky=1;
 CREATE TABLE IF NOT EXISTS delivery_deferrals (
  reason TEXT PRIMARY KEY CHECK(reason IN ('dns_global_capacity','dns_project_capacity')),
  count INTEGER NOT NULL, last_seen_at REAL NOT NULL
@@ -323,6 +329,19 @@ class Store:
                     db.execute(
                         "ALTER TABLE deliveries ADD COLUMN lease_is_probe INTEGER NOT NULL DEFAULT 0"
                     )
+            if version < 5:
+                additions = {
+                    "endpoints": {
+                        "response_class": "TEXT NOT NULL DEFAULT 'unknown'",
+                        "response_classified_at": "REAL NOT NULL DEFAULT 0",
+                    },
+                    "deliveries": {"lease_is_risky": "INTEGER NOT NULL DEFAULT 0"},
+                }
+                for table, columns in additions.items():
+                    existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+                    for name, definition in columns.items():
+                        if name not in existing:
+                            db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
             for statement in AVAILABILITY_SCHEMA.split(";"):
                 if statement.strip():
                     db.execute(statement)
@@ -509,6 +528,18 @@ class Store:
                 name, value = "subscriptions_json", json.dumps(_subscriptions(value))
             values[name] = value
         with self._db(True) as db:
+            if "url" in values:
+                previous = db.execute(
+                    "SELECT url FROM endpoints WHERE id=? AND project_id=?",
+                    (endpoint_id, project_id),
+                ).fetchone()
+                if previous is not None and previous["url"] != values["url"]:
+                    values.update(
+                        response_class="unknown",
+                        response_classified_at=0,
+                        consecutive_timeouts=0,
+                        cooldown_until=0,
+                    )
             db.execute(
                 "UPDATE endpoints SET "
                 + ",".join(f"{name}=?" for name in values)
@@ -669,7 +700,15 @@ class Store:
         return result
 
     @staticmethod
-    def _next_delivery(db, now, endpoint_concurrency, project_concurrency, max_failing_probes):
+    def _next_delivery(
+        db,
+        now,
+        endpoint_concurrency,
+        project_concurrency,
+        max_failing_probes,
+        worker_concurrency,
+        endpoint_filter,
+    ):
         probe_available = (
             db.execute(
                 """SELECT COUNT(*) FROM deliveries INDEXED BY deliveries_processing_probes
@@ -678,6 +717,11 @@ class Store:
             ).fetchone()[0]
             < max_failing_probes
         )
+        risky_available = db.execute(
+            """SELECT COUNT(*) FROM deliveries INDEXED BY deliveries_processing_risky
+            WHERE status='processing' AND lease_is_risky=1 AND lease_expires_at>?""",
+            (now,),
+        ).fetchone()[0] < max(1, worker_concurrency - 1)
         projects = db.execute(
             """SELECT p.id FROM projects p WHERE
             (SELECT COUNT(*) FROM deliveries d INDEXED BY deliveries_processing_project
@@ -686,6 +730,11 @@ class Store:
             (now, project_concurrency),
         )
         for project in projects:
+            project_risky_available = risky_available and db.execute(
+                """SELECT COUNT(*) FROM deliveries INDEXED BY deliveries_processing_risky_project
+                WHERE project_id=? AND status='processing' AND lease_is_risky=1 AND lease_expires_at>?""",
+                (project["id"], now),
+            ).fetchone()[0] < max(1, project_concurrency - 1)
             endpoints = db.execute(
                 """SELECT ep.* FROM endpoints ep
                 WHERE ep.project_id=? AND ep.enabled=1 AND ep.next_available_at<=?
@@ -696,6 +745,17 @@ class Store:
                 (project["id"], now, now, probe_available, now, endpoint_concurrency),
             )
             for endpoint in endpoints:
+                risky = (
+                    endpoint["consecutive_timeouts"] > 0
+                    or endpoint["response_class"] != "responsive"
+                    or endpoint["response_classified_at"] <= now - RESPONSIVE_SECONDS
+                )
+                if risky and not project_risky_available:
+                    continue
+                if endpoint_filter is not None and not endpoint_filter(
+                    endpoint["url"], project["id"]
+                ):
+                    continue
                 # Each lookup reads at most one indexed candidate. Disabled/rate-limited
                 # endpoints never scan their parked deliveries while holding the writer lock.
                 candidates = [
@@ -732,6 +792,7 @@ class Store:
                         ),
                         "rate_limit": endpoint["rate_limit"],
                         "lease_is_probe": int(endpoint["consecutive_timeouts"] > 0),
+                        "lease_is_risky": int(risky),
                     }
         return None
 
@@ -742,6 +803,8 @@ class Store:
         endpoint_concurrency=1,
         project_concurrency=2,
         max_failing_probes=1,
+        worker_concurrency=4,
+        endpoint_filter=None,
     ):
         if not math.isfinite(lease_seconds) or lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive and finite")
@@ -749,26 +812,36 @@ class Store:
             ("endpoint_concurrency", endpoint_concurrency),
             ("project_concurrency", project_concurrency),
             ("max_failing_probes", max_failing_probes),
+            ("worker_concurrency", worker_concurrency),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if endpoint_filter is not None and not callable(endpoint_filter):
+            raise TypeError("endpoint_filter must be callable")
         with self._db(True) as db:
             now = time.time()
             row = self._next_delivery(
-                db, now, endpoint_concurrency, project_concurrency, max_failing_probes
+                db,
+                now,
+                endpoint_concurrency,
+                project_concurrency,
+                max_failing_probes,
+                worker_concurrency,
+                endpoint_filter,
             )
             if row is None:
                 return None
             token = secrets.token_urlsafe(24)
             db.execute(
                 """UPDATE deliveries SET status='processing',lease_token=?,lease_expires_at=?,
-                lease_started_at=?,lease_endpoint_url=?,lease_is_probe=?,updated_at=? WHERE id=?""",
+                lease_started_at=?,lease_endpoint_url=?,lease_is_probe=?,lease_is_risky=?,updated_at=? WHERE id=?""",
                 (
                     token,
                     now + lease_seconds,
                     now,
                     row["endpoint_url"],
                     row["lease_is_probe"],
+                    row["lease_is_risky"],
                     now,
                     row["id"],
                 ),
@@ -845,7 +918,8 @@ class Store:
             db.execute(
                 """UPDATE deliveries SET status=?,attempt_count=?,cycle_attempts=?,next_attempt_at=?,last_status_code=?,last_error=?,last_duration_ms=?,
                           last_response_excerpt=?,updated_at=?,last_endpoint_url=lease_endpoint_url,
-                          lease_endpoint_url=NULL,lease_token=NULL,lease_expires_at=NULL,lease_started_at=NULL,lease_is_probe=0 WHERE id=?""",
+                          lease_endpoint_url=NULL,lease_token=NULL,lease_expires_at=NULL,lease_started_at=NULL,
+                          lease_is_probe=0,lease_is_risky=0 WHERE id=?""",
                 (
                     status,
                     number,
@@ -859,10 +933,16 @@ class Store:
                     delivery_id,
                 ),
             )
+            previous = db.execute(
+                "SELECT consecutive_timeouts FROM endpoints WHERE id=? AND url=?",
+                (row["endpoint_id"], row["lease_endpoint_url"]),
+            ).fetchone()
+            # A completed request to an old URL belongs in history, but says
+            # nothing about the endpoint's replacement destination.
+            if previous is None:
+                return True
             if timed_out and status != "delivered":
-                previous = db.execute(
-                    "SELECT consecutive_timeouts FROM endpoints WHERE id=?", (row["endpoint_id"],)
-                ).fetchone()[0]
+                previous = previous["consecutive_timeouts"]
                 streak = min(previous + 1, 32)
                 cooldown = min(600, 30 * 2 ** min(streak - 3, 5)) if streak >= 3 else 0
                 db.execute(
@@ -875,6 +955,14 @@ class Store:
                 db.execute(
                     "UPDATE endpoints SET consecutive_timeouts=0,cooldown_until=0 WHERE id=?",
                     (row["endpoint_id"],),
+                )
+            if status_code is not None or timed_out or duration_ms >= SLOW_RESPONSE_MS:
+                response_class = (
+                    "slow" if timed_out or duration_ms >= SLOW_RESPONSE_MS else "responsive"
+                )
+                db.execute(
+                    "UPDATE endpoints SET response_class=?,response_classified_at=? WHERE id=?",
+                    (response_class, now, row["endpoint_id"]),
                 )
             return True
 
@@ -894,7 +982,7 @@ class Store:
             changed = db.execute(
                 """UPDATE deliveries SET status=CASE WHEN cycle_attempts=0 THEN 'pending' ELSE 'retrying' END,
                 next_attempt_at=?,updated_at=?,lease_token=NULL,lease_expires_at=NULL,lease_started_at=NULL,
-                lease_endpoint_url=NULL,lease_is_probe=0
+                lease_endpoint_url=NULL,lease_is_probe=0,lease_is_risky=0
                 WHERE id=? AND status='processing' AND lease_token=? AND lease_expires_at>?""",
                 (now + retry_after_seconds, now, delivery_id, lease_token, now),
             ).rowcount

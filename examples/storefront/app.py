@@ -113,9 +113,7 @@ class Storefront:
                 new_secrets[service] = secret
             changes["secrets"] = new_secrets
         if not changes:
-            raise ValueError(
-                "Set RELAY_PROJECT_KEY or a receiver signing-secret environment variable"
-            )
+            raise ValueError("Select at least one credential field to update")
         with self.db() as db:
             db.executemany(
                 "UPDATE configuration SET value=? WHERE key=?",
@@ -536,25 +534,56 @@ def main():
     parser.add_argument("--relay-url", default="http://127.0.0.1:8787")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--resume-blocked", action="store_true")
+    parser.add_argument(
+        "--project-key-env", metavar="NAME", help="Read the new project API key from NAME"
+    )
+    for service in SERVICES:
+        parser.add_argument(
+            f"--{service}-secret-env",
+            metavar="NAME",
+            help=f"Read the new {service} signing secret from NAME",
+        )
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("Port must be between 1 and 65535")
+    selectors = {
+        field: (name, label)
+        for field, name, label in [
+            ("api_key", args.project_key_env, "project API key"),
+            *(
+                (service, getattr(args, f"{service}_secret_env"), f"{service} signing secret")
+                for service in SERVICES
+            ),
+        ]
+        if name is not None
+    }
+    if args.command != "credentials" and (selectors or args.resume_blocked):
+        parser.error("Credential selectors and --resume-blocked require the credentials command")
+    credentials = {}
+    if args.command == "credentials":
+        if not selectors:
+            parser.error("Select at least one credential field with a --*-env option")
+        for field, (name, label) in selectors.items():
+            value = os.environ.get(name)
+            if not value:
+                parser.error(
+                    f"The selected environment variable for {label} must be set and nonempty"
+                )
+            credentials[field] = value
     store = Storefront(args.db)
     if args.command == "credentials":
         try:
             resumed = store.update_credentials(
-                os.environ.get("RELAY_PROJECT_KEY"),
-                {
-                    service: os.environ[name]
-                    for service in SERVICES
-                    if (name := f"RELAY_{service.upper()}_SIGNING_SECRET") in os.environ
-                },
+                credentials.get("api_key"),
+                {service: credentials[service] for service in SERVICES if service in credentials},
                 args.resume_blocked,
             )
         except ValueError as exc:
             parser.error(str(exc))
+        fields = ", ".join(label for _, label in selectors.values())
         print(
-            f"Credentials updated. Resumed {resumed} blocked submissions with their original keys."
+            f"Updated credential fields: {fields}. "
+            f"Resumed {resumed} blocked submissions with their original keys."
         )
         return
     if args.command == "resume":

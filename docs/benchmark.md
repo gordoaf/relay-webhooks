@@ -51,6 +51,16 @@ A local 60-second workload sent one event every four seconds to a receiver that 
 
 A v0.2.1 stress run used four projects with four hung destinations each, plus one healthy project, with each project submitting every two seconds for 60 seconds. It used the real worker and local sockets, followed by an eight-second drain window and graceful worker shutdown. All 30 healthy deliveries completed: median end-to-end latency 9.79 seconds, mean 11.94 seconds, maximum 34.03 seconds. This run used Windows and CPython 3.14.3 and overlapped other local tests. It shows progress through correlated failures, not low latency during their initial discovery: new destinations can occupy slots before their first timeout identifies them for the shared probe limit.
 
+The v0.2.2 checks below used the same 60-second submission pattern, eight-second drain, four real workers, and local sockets on Windows/CPython 3.14.3. Slow receivers waited 9.5 seconds before returning HTTP 200 or 503: two projects with two destinations each. The hung-receiver case used four projects with four destinations each. All destinations started untested. Each workload included a separate healthy HTTP 204 receiver receiving one event about every two seconds.
+
+| Competing receivers | Healthy deliveries | Median end-to-end | Mean | Maximum |
+| --- | --- | --- | --- | --- |
+| Slow HTTP 200 | 30 / 30 | 0.21 s | 0.24 s | 0.53 s |
+| Slow HTTP 503 | 30 / 30 | 0.21 s | 0.25 s | 0.54 s |
+| No HTTP response | 29 / 29 | 0.35 s | 1.34 s | 10.07 s |
+
+These are single local runs, executed concurrently with one another and other checks. The elapsed-time submission loop fit 29 healthy submissions in the hung-receiver run; all completed. The slow-response endpoints kept zero timeout streaks. Their backlog remained because the incoming workload exceeded slow-receiver capacity. The bounded slow/untested lane improves healthy progress without turning a slow HTTP 200 into a failure. A healthy destination's first request can still wait for a first-contact slot, visible in the hung-receiver maximum. Once classified, it can use reserved responsive capacity. These measurements do not establish a latency guarantee or internet throughput claim.
+
 The scheduler still examines enabled endpoints to find eligible work. Thousands of mostly idle endpoints can make that scan a meaningful part of claim latency, even with a small delivery backlog. The parked-backlog benchmark does not measure this workload. Measure endpoint count, fanout, concurrent receiver failures, and queue age on the intended hardware before increasing scale; a durable indexed next-work schedule would be a separate scaling change.
 
 Retention throughput depends on attempts per event, fanout, disk speed, and how many older events remain unfinished. Automatic maintenance uses bounded bursts and catch-up passes instead of one batch every 30 seconds. Each transaction remains limited by `RELAY_CLEANUP_BATCH_SIZE`; pending deliveries and queued recovery members remain protected. A configured retention age is an eligibility rule, not a guarantee that all eligible history has already been removed. Monitor storage and verify cleanup can keep pace with the expected sustained workload.

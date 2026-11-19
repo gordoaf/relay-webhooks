@@ -9,7 +9,7 @@ The service defaults to `http://127.0.0.1:8787`. JSON request bodies are limited
 - Cookie-authenticated mutations require a matching Origin or `X-Relay-Request: 1`. A mismatched Origin is rejected even with that header.
 - Event ingestion accepts a project API key, which cannot access administrative endpoints.
 - An optional `RELAY_METRICS_TOKEN` permits only `GET` and `HEAD /metrics`. It cannot log in, submit events, or access administrative APIs.
-- Repeated failed administrator authentication receives HTTP 429 with `Retry-After`. Successful logins do not consume the failure allowance, and valid administrator credentials remain usable after other failed attempts. Credentials are checked before that response, so it does not cap comparisons or prevent guessing on its own. Enforce the hard request ceiling at the ingress proxy and generate an unpredictable administrator token.
+- Repeated failed administrator or metrics authentication receives HTTP 429 with `Retry-After`. Successful logins do not consume the failure allowance, and valid credentials remain usable after other failed attempts. Credentials are checked before that response, including on `/metrics`, so it does not cap comparisons or prevent guessing on its own. Enforce the hard request ceiling at the ingress proxy for both routes and generate unpredictable tokens.
 
 ## Event ingestion
 

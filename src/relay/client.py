@@ -5,10 +5,12 @@ the same payload after an ambiguous network failure, including after restart.
 """
 
 import http.client
+import ipaddress
 import json
 import math
 import re
 import socket
+import ssl
 import threading
 import time
 from typing import Any, TypedDict
@@ -16,7 +18,7 @@ from urllib.parse import urlsplit
 
 from .delivery import verify_signature
 
-__all__ = ["EventReceipt", "RelayClient", "RelayError", "verify_signature"]
+__all__ = ["EventReceipt", "RelayClient", "RelayError", "RelayEventExpired", "verify_signature"]
 
 
 class EventReceipt(TypedDict):
@@ -27,11 +29,30 @@ class EventReceipt(TypedDict):
 class RelayError(Exception):
     """An ingestion failure; an absent status may mean the event was committed."""
 
-    def __init__(self, message, *, idempotency_key, status=None, retryable=False):
+    def __init__(self, message, *, idempotency_key, status=None, retryable=False, cause=None):
         super().__init__(message)
         self.idempotency_key = idempotency_key
         self.status = status
         self.retryable = retryable
+        self.cause = cause
+
+
+class RelayEventExpired(RelayError):
+    """The event was accepted earlier; its retained details are no longer available.
+
+    Acceptance does not establish successful delivery to any receiver.
+    """
+
+    accepted = True
+
+    def __init__(self, *, idempotency_key, event_id):
+        super().__init__(
+            "Relay previously accepted this event, but its retained details expired; "
+            "do not resubmit under a new idempotency key",
+            idempotency_key=idempotency_key,
+            status=410,
+        )
+        self.event_id = event_id
 
 
 class RelayClient:
@@ -43,6 +64,11 @@ class RelayClient:
     """
 
     def __init__(self, base_url, api_key, *, timeout=10.0, max_retries=2):
+        if not isinstance(base_url, str) or any(
+            char.isspace() or ord(char) < 32 or ord(char) == 127 or char == "\\"
+            for char in base_url
+        ):
+            raise ValueError("base_url must be a valid HTTP(S) origin")
         parts = urlsplit(base_url)
         if (
             parts.scheme not in {"http", "https"}
@@ -55,9 +81,24 @@ class RelayClient:
         ):
             raise ValueError("base_url must be an HTTP(S) origin without credentials or a path")
         try:
-            port = parts.port
-        except ValueError:
-            raise ValueError("base_url has an invalid port") from None
+            port = (
+                parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
+            )
+            if not 1 <= port <= 65535:
+                raise ValueError()
+            if ":" in parts.hostname:
+                host = str(ipaddress.IPv6Address(parts.hostname))
+                if "%" in host:
+                    raise ValueError()
+            else:
+                host = parts.hostname.encode("idna").decode("ascii").lower()
+                if len(host.rstrip(".")) > 253 or not all(
+                    re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                    for label in host.removesuffix(".").split(".")
+                ):
+                    raise ValueError()
+        except (ValueError, UnicodeError):
+            raise ValueError("base_url has an invalid hostname or port") from None
         if (
             not isinstance(api_key, str)
             or not api_key
@@ -72,7 +113,7 @@ class RelayClient:
             raise ValueError("timeout must be between 0 and 120 seconds")
         if type(max_retries) is not int or not 0 <= max_retries <= 5:
             raise ValueError("max_retries must be an integer between 0 and 5")
-        self._host, self._port, self._secure = parts.hostname, port, parts.scheme == "https"
+        self._host, self._port, self._secure = host, port, parts.scheme == "https"
         self._api_key, self.timeout, self.max_retries = api_key, timeout, max_retries
 
     def emit(self, event_type, payload, *, idempotency_key) -> EventReceipt:
@@ -128,6 +169,23 @@ class RelayClient:
                             idempotency_key=idempotency_key,
                             retryable=True,
                         )
+                elif status == 410:
+                    try:
+                        expired = json.loads(raw)
+                        event_id = expired.get("event_id") if isinstance(expired, dict) else None
+                        if not isinstance(event_id, str) or not re.fullmatch(
+                            r"[\x21-\x7e]{1,200}", event_id
+                        ):
+                            raise ValueError("Invalid expired-event receipt")
+                        error = RelayEventExpired(
+                            idempotency_key=idempotency_key, event_id=event_id
+                        )
+                    except (ValueError, TypeError, UnicodeError):
+                        error = RelayError(
+                            "Relay returned an invalid expired-event receipt; retain the original idempotency key",
+                            idempotency_key=idempotency_key,
+                            status=status,
+                        )
                 else:
                     error = RelayError(
                         f"Relay rejected the event (HTTP {status})",
@@ -135,14 +193,27 @@ class RelayClient:
                         idempotency_key=idempotency_key,
                         retryable=status in {408, 429} or 500 <= status <= 599,
                     )
-            except (OSError, http.client.HTTPException):
+            except ssl.SSLCertVerificationError as exc:
+                error = RelayError(
+                    "Relay TLS certificate verification failed; check the certificate and hostname",
+                    idempotency_key=idempotency_key,
+                    cause=exc,
+                )
+            except UnicodeError as exc:
+                error = RelayError(
+                    "Relay hostname encoding failed; check base_url",
+                    idempotency_key=idempotency_key,
+                    cause=exc,
+                )
+            except (OSError, http.client.HTTPException) as exc:
                 error = RelayError(
                     "Relay could not confirm acceptance; reuse the same idempotency key",
                     idempotency_key=idempotency_key,
                     retryable=True,
+                    cause=exc,
                 )
             if not error.retryable or attempt == self.max_retries:
-                raise error from None
+                raise error from error.cause
             delay = min(5.0, 0.25 * 2**attempt)
             if retry_after and retry_after.isascii() and retry_after.isdigit():
                 delay = min(5.0, max(delay, float(retry_after[:8])))

@@ -28,7 +28,7 @@
       <section class="panel history"><div class="section-heading"><div><p class="eyebrow">DURABLE BUSINESS EFFECTS</p><h2>Order activity <span id="order-count">0</span></h2></div><span id="refresh" class="fine">Updates every 2 seconds</span></div>
         <div class="table-scroll"><table><thead><tr><th>Order</th><th>Customer</th><th>Total</th><th>Event acceptance</th><th>Warehouse</th><th>Accounting</th></tr></thead><tbody id="orders"></tbody></table></div><p id="empty" class="empty">Your first order will appear here. Orders survive a restart.</p>
       </section>
-      <section id="outbox-panel" class="panel outbox" hidden><p class="eyebrow">WAITING FOR RELAY</p><h2>Pending event submissions</h2><p>If Relay is unavailable, the outbox keeps events on disk and retries with the same idempotency key.</p><ul id="outbox"></ul></section>
+      <section id="outbox-panel" class="panel outbox" hidden><p class="eyebrow">WAITING FOR RELAY</p><h2>Pending event submissions</h2><p>If Relay is unavailable, the outbox keeps events on disk and retries with the same idempotency key. After fixing a credential or configuration error, resume blocked submissions below. Conflicting payloads still require inspection.</p><button id="resume-outbox" type="button" hidden>Retry blocked submissions</button><ul id="outbox"></ul></section>
       <footer>Signed raw requests · Persistent event deduplication · Transactional outbox<span>Keep this example on your local machine.</span></footer>
     </main>
   </div>

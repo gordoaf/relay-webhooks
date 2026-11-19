@@ -68,8 +68,10 @@ def env_bool(name, default):
 class Settings:
     db_path: str = "data/relay.db"
     admin_token: str = ""
+    metrics_token: str = ""
     allow_private_networks: bool = False
     worker_enabled: bool = True
+    worker_concurrency: int = 4
     host: str = "127.0.0.1"
     port: int = 8787
     max_payload_bytes: int = 262144
@@ -95,6 +97,21 @@ class Settings:
 
     def __post_init__(self):
         object.__setattr__(self, "public_url", public_origin(self.public_url))
+        if (
+            isinstance(self.worker_concurrency, bool)
+            or not isinstance(self.worker_concurrency, int)
+            or not 1 <= self.worker_concurrency <= 64
+        ):
+            raise ValueError("RELAY_WORKER_CONCURRENCY must be an integer between 1 and 64")
+        if self.metrics_token:
+            if len(self.metrics_token) < 24 or any(
+                ord(character) < 33 or ord(character) > 126 for character in self.metrics_token
+            ):
+                raise ValueError(
+                    "RELAY_METRICS_TOKEN must contain at least 24 printable ASCII characters"
+                )
+            if self.metrics_token == self.admin_token:
+                raise ValueError("RELAY_METRICS_TOKEN must differ from RELAY_ADMIN_TOKEN")
         self.operations_policy()
 
     def operations_policy(self):
@@ -121,8 +138,10 @@ class Settings:
         return cls(
             db_path=os.getenv("RELAY_DB_PATH", "data/relay.db"),
             admin_token=os.getenv("RELAY_ADMIN_TOKEN", ""),
+            metrics_token=os.getenv("RELAY_METRICS_TOKEN", ""),
             allow_private_networks=env_bool("RELAY_ALLOW_PRIVATE_NETWORKS", False),
             worker_enabled=env_bool("RELAY_WORKER_ENABLED", True),
+            worker_concurrency=int(os.getenv("RELAY_WORKER_CONCURRENCY", "4")),
             public_url=os.getenv("RELAY_PUBLIC_URL", ""),
             retention_days=int(os.getenv("RELAY_RETENTION_DAYS", "0")),
             idempotency_days=int(os.getenv("RELAY_IDEMPOTENCY_DAYS", "90")),

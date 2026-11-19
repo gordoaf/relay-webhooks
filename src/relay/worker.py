@@ -7,6 +7,7 @@ import random
 import threading
 import time
 from .delivery import DeliveryResult, deliver, sign_headers
+from .events import serialize_event
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +22,14 @@ class Worker:
         retry_base=2.0,
         concurrency=4,
     ):
-        if concurrency < 1 or max_attempts < 1:
-            raise ValueError("Concurrency and max_attempts must be positive")
+        if (
+            isinstance(concurrency, bool)
+            or not isinstance(concurrency, int)
+            or not 1 <= concurrency <= 64
+        ):
+            raise ValueError("Concurrency must be an integer between 1 and 64")
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
         if not math.isfinite(poll_interval) or poll_interval <= 0:
             raise ValueError("poll_interval must be positive and finite")
         if not math.isfinite(retry_base) or retry_base < 0:
@@ -42,17 +49,12 @@ class Worker:
         attempt = job["cycle_attempts"] + 1
         started = time.monotonic()
         try:
-            body = json.dumps(
-                {
-                    "id": job["event_id"],
-                    "type": job["event_type"],
-                    "created_at": job["created_at"],
-                    "data": json.loads(job["payload_json"]),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            ).encode("utf-8")
+            body = serialize_event(
+                job["event_id"],
+                job["event_type"],
+                job["created_at"],
+                json.loads(job["payload_json"]),
+            )
             headers = sign_headers(
                 job["signing_secret"],
                 job["event_id"],
@@ -61,7 +63,12 @@ class Worker:
             )
             headers["webhook-type"] = job["event_type"]
             result = deliver(
-                job["endpoint_url"], body, headers, timeout=10, allow_private=self.allow_private
+                job["endpoint_url"],
+                body,
+                headers,
+                timeout=10,
+                allow_private=self.allow_private,
+                resolver_scope=job["project_id"],
             )
         except (ValueError, TypeError, UnicodeError):
             result = DeliveryResult(None, "Invalid delivery configuration", 0, "", permanent=True)
@@ -70,6 +77,20 @@ class Worker:
             result = DeliveryResult(
                 None, "Unexpected delivery error", (time.monotonic() - started) * 1000, ""
             )
+        if result.deferred_reason is not None:
+            accepted = self.store.defer_delivery(
+                job["delivery_id"],
+                job["lease_token"],
+                reason=result.deferred_reason,
+                retry_after_seconds=random.uniform(0.5, 1.5),
+            )
+            logger.info(
+                "delivery=%s deferred=%s lease_accepted=%s",
+                job["delivery_id"],
+                result.deferred_reason,
+                accepted,
+            )
+            return True
         status = result.status_code
         retryable = status is None or status in (408, 429) or 500 <= status <= 599
         next_attempt_at = None

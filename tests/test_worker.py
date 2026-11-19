@@ -4,6 +4,7 @@ import threading
 import pytest
 import relay.worker as module
 from relay.delivery import DeliveryResult, verify_signature
+import relay.delivery as delivery_module
 from relay.worker import Worker
 
 
@@ -118,6 +119,69 @@ def test_policy_rejection_is_permanent(store, project, endpoint, monkeypatch):
     assert row["status"] == "failed" and row["attempt_count"] == 1
     assert row["next_attempt_at"] is None
     assert "nonpublic" in row["last_error"]
+
+
+def test_exhausted_dns_capacity_never_spends_attempts_or_cools_down_receiver(
+    store, project, endpoint, monkeypatch
+):
+    store.create_event(project["id"], "test", {})
+    monkeypatch.setattr(delivery_module, "_DNS_SLOTS", threading.BoundedSemaphore(0))
+    monkeypatch.setattr(delivery_module, "_DNS_PROJECT_COUNTS", {})
+    requests = []
+    monkeypatch.setattr(
+        delivery_module._PinnedConnection, "request", lambda *a, **kw: requests.append(True)
+    )
+    worker = Worker(store)
+    for _ in range(12):
+        with store._db(True) as db:
+            db.execute("UPDATE deliveries SET next_attempt_at=0")
+            db.execute("UPDATE endpoints SET next_available_at=0")
+        assert worker.run_once()
+        assert not worker.run_once()  # Deferred work has a delay, not a busy loop.
+    row = store.list_deliveries(project["id"])["items"][0]
+    detail = store.delivery_detail(project["id"], row["id"])
+    assert row["status"] == "pending" and row["attempt_count"] == row["cycle_attempts"] == 0
+    assert detail["attempts"] == [] and requests == []
+    with store._db() as db:
+        ep = db.execute("SELECT consecutive_timeouts,cooldown_until FROM endpoints").fetchone()
+        assert tuple(ep) == (0, 0)
+    assert store.deferral_stats()["dns_global_capacity"]["count"] == 12
+
+
+def test_known_hung_endpoints_leave_delivery_capacity_for_healthy_work(store, monkeypatch):
+    bad = []
+    for index in range(4):
+        owner = store.create_project(f"Hung {index}")
+        store.create_endpoint(owner["id"], f"https://hung{index}.example/hook", rate_limit=1000)
+        store.create_event(owner["id"], "test", {})
+        bad.append(owner["id"])
+    with store._db(True) as db:
+        db.execute("UPDATE endpoints SET consecutive_timeouts=1")
+    good = store.create_project("Healthy")
+    store.create_endpoint(good["id"], "https://healthy.example/hook", rate_limit=1000)
+    store.create_event(good["id"], "test", {})
+    entered, release, healthy = threading.Event(), threading.Event(), threading.Event()
+    hung_calls = []
+
+    def receiver(url, *args, **kwargs):
+        if "hung" in url:
+            hung_calls.append(url)
+            entered.set()
+            assert release.wait(5)
+            return DeliveryResult(None, "Timeout", 1, "", timed_out=True)
+        healthy.set()
+        return DeliveryResult(204, None, 1, "")
+
+    monkeypatch.setattr(module, "deliver", receiver)
+    worker = Worker(store, concurrency=4, poll_interval=0.01)
+    worker.start()
+    try:
+        assert entered.wait(2)
+        assert healthy.wait(2)
+        assert len(hung_calls) == 1
+    finally:
+        release.set()
+        worker.stop()
 
 
 def test_timeouts_put_endpoint_into_persistent_cooldown(store, project, endpoint, monkeypatch):

@@ -23,6 +23,9 @@ _DNS_SLOTS = threading.BoundedSemaphore(8)
 _DNS_LOCK = threading.Lock()
 _DNS_INFLIGHT = {}
 _DNS_HOSTS = {}
+_DNS_PROJECT_COUNTS = {}
+_DNS_PROJECT_LIMIT = 2
+_DNS_DELIVERY_LIMIT = 6  # Two of the eight OS slots remain available to operator requests.
 _DNS_FAILURES = OrderedDict()
 _DNS_CACHE_LIMIT = 256
 _DNS_FAILURE_SECONDS = 5.0
@@ -66,7 +69,20 @@ class DNSResolutionError(OSError):
 
 
 class DNSResolutionTimeout(TimeoutError):
-    """A resolver timeout or temporary lack of resolver capacity."""
+    """The destination's own resolver lookup did not complete in time."""
+
+
+class DeliveryCapacityUnavailable(OSError):
+    """Local resolver admission pressure; no destination attempt was made."""
+
+    def __init__(self, reason="dns_global_capacity"):
+        self.reason = reason
+        message = (
+            "Project DNS lookup capacity is temporarily exhausted"
+            if reason == "dns_project_capacity"
+            else "DNS lookup capacity is temporarily exhausted"
+        )
+        super().__init__(message)
 
 
 @dataclass
@@ -86,6 +102,7 @@ class DeliveryResult:
     retry_after_seconds: float | None = None
     permanent: bool = False
     timed_out: bool = False
+    deferred_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -106,7 +123,18 @@ def _remember_dns_failure(host, timed_out):
         _DNS_FAILURES.popitem(last=False)
 
 
-def _resolve(host, port, deadline):
+def _release_dns_slot(project_id):
+    # Called under _DNS_LOCK; caller timeouts never return OS lookup capacity.
+    if project_id is not None:
+        remaining = _DNS_PROJECT_COUNTS[project_id] - 1
+        if remaining:
+            _DNS_PROJECT_COUNTS[project_id] = remaining
+        else:
+            del _DNS_PROJECT_COUNTS[project_id]
+    _DNS_SLOTS.release()
+
+
+def _resolve(host, port, deadline, resolver_scope=None):
     host = host.rstrip(".").lower()
     key = (host, port)
     while True:
@@ -133,15 +161,24 @@ def _resolve(host, port, deadline):
             else:
                 # No queued resolver threads. The slot stays occupied until
                 # the OS call ends, even if every caller has timed out.
+                if resolver_scope is not None:
+                    if _DNS_PROJECT_COUNTS.get(resolver_scope, 0) >= _DNS_PROJECT_LIMIT:
+                        raise DeliveryCapacityUnavailable("dns_project_capacity")
+                    if sum(_DNS_PROJECT_COUNTS.values()) >= _DNS_DELIVERY_LIMIT:
+                        raise DeliveryCapacityUnavailable()
                 if not _DNS_SLOTS.acquire(blocking=False):
-                    raise DNSResolutionTimeout("DNS lookup capacity is temporarily exhausted")
+                    raise DeliveryCapacityUnavailable()
+                if resolver_scope is not None:
+                    _DNS_PROJECT_COUNTS[resolver_scope] = (
+                        _DNS_PROJECT_COUNTS.get(resolver_scope, 0) + 1
+                    )
                 lookup = _DNSLookup()
                 _DNS_INFLIGHT[key] = _DNS_HOSTS[host] = lookup
                 start_lookup = same_key = True
 
         if start_lookup:
 
-            def run_lookup(state=lookup):
+            def run_lookup(state=lookup, project_id=resolver_scope):
                 try:
                     state.addresses = tuple(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
                     if not state.addresses:
@@ -156,7 +193,7 @@ def _resolve(host, port, deadline):
                             _DNS_FAILURES.pop(host, None)
                         _DNS_INFLIGHT.pop(key, None)
                         _DNS_HOSTS.pop(host, None)
-                        _DNS_SLOTS.release()
+                        _release_dns_slot(project_id)
                         state.ready.set()
 
             try:
@@ -167,7 +204,7 @@ def _resolve(host, port, deadline):
                     _DNS_INFLIGHT.pop(key, None)
                     _DNS_HOSTS.pop(host, None)
                     _remember_dns_failure(host, False)
-                    _DNS_SLOTS.release()
+                    _release_dns_slot(resolver_scope)
                     lookup.ready.set()
                 raise DNSResolutionError("DNS lookup could not be started") from exc
         if not lookup.ready.wait(max(0, deadline - time.monotonic())):
@@ -202,7 +239,7 @@ def _public_address(address):
     )
 
 
-def _target(url, allow_private, deadline):
+def _target(url, allow_private, deadline, resolver_scope=None):
     if (
         not isinstance(url, str)
         or len(url) > 8192
@@ -232,7 +269,7 @@ def _target(url, allow_private, deadline):
         raise NetworkPolicyError("Invalid hostname")
     secure = parts.scheme == "https"
     port = port or (443 if secure else 80)
-    addresses = _resolve(host, port, deadline)
+    addresses = _resolve(host, port, deadline, resolver_scope)
     if not addresses:
         raise DNSResolutionError("Endpoint hostname has no addresses")
     for family, _, _, _, sockaddr in addresses:
@@ -252,6 +289,8 @@ def _target(url, allow_private, deadline):
 def validate_endpoint(url, allow_private=False):
     try:
         _target(url, allow_private, time.monotonic() + 5)
+    except DeliveryCapacityUnavailable:
+        raise
     except (OSError, UnicodeError) as exc:
         raise ValueError("Endpoint hostname could not be resolved") from exc
 
@@ -391,13 +430,13 @@ def _retry_after(value):
     return max(0, min(seconds, 3600))
 
 
-def deliver(url, body, headers, timeout=10, allow_private=False):
+def deliver(url, body, headers, timeout=10, allow_private=False, *, resolver_scope=None):
     started = time.monotonic()
     connection = watchdog = excerpt_watchdog = response = None
     try:
         if timeout <= 0:
             raise ValueError("Timeout must be positive")
-        target = _target(url, allow_private, started + timeout)
+        target = _target(url, allow_private, started + timeout, resolver_scope)
         connection = _PinnedConnection(target, started + timeout)
         watchdog = threading.Timer(connection.remaining(), connection.abort)
         watchdog.daemon = True
@@ -437,6 +476,15 @@ def deliver(url, body, headers, timeout=10, allow_private=False):
             (time.monotonic() - started) * 1000,
             excerpt.decode("utf-8", errors="replace"),
             retry_after,
+        )
+    except DeliveryCapacityUnavailable as exc:
+        return DeliveryResult(
+            None,
+            str(exc),
+            (time.monotonic() - started) * 1000,
+            "",
+            retry_after_seconds=1,
+            deferred_reason=exc.reason,
         )
     except NetworkPolicyError as exc:
         return DeliveryResult(

@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import secrets
@@ -18,7 +19,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
-from relay.client import RelayClient, RelayError, verify_signature
+from relay.client import RelayClient, RelayError, RelayEventExpired, verify_signature
 
 HERE = Path(__file__).resolve().parent
 SERVICES = {"warehouse": "order.created", "accounting": "invoice.paid"}
@@ -45,7 +46,8 @@ class Storefront:
                     payload TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
                     event_id TEXT, attempts INTEGER NOT NULL DEFAULT 0,
                     next_attempt_at REAL NOT NULL DEFAULT 0, last_error TEXT,
-                    blocked INTEGER NOT NULL DEFAULT 0);
+                    blocked INTEGER NOT NULL DEFAULT 0,
+                    acceptance_expired INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS receipts(
                     service TEXT NOT NULL, event_id TEXT NOT NULL, order_id TEXT NOT NULL,
                     received_at REAL NOT NULL, PRIMARY KEY(service,event_id));
@@ -55,6 +57,12 @@ class Storefront:
             """)
             for name in SERVICES:
                 db.execute("INSERT OR IGNORE INTO services VALUES(?,1)", (name,))
+            if "acceptance_expired" not in {
+                row["name"] for row in db.execute("PRAGMA table_info(outbox)")
+            }:
+                db.execute(
+                    "ALTER TABLE outbox ADD COLUMN acceptance_expired INTEGER NOT NULL DEFAULT 0"
+                )
 
     @contextmanager
     def db(self):
@@ -79,6 +87,54 @@ class Storefront:
                 "INSERT INTO configuration VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 [(key, json.dumps(value)) for key, value in config.items()],
             )
+
+    def update_credentials(self, api_key=None, signing_secrets=None, resume_blocked=False):
+        config = self.config()
+        if not config:
+            raise ValueError("Run setup first")
+        changes = {}
+        if api_key is not None:
+            RelayClient(config["relay_url"], api_key)
+            changes["api_key"] = api_key
+        if signing_secrets:
+            new_secrets = dict(config["secrets"])
+            for service, secret in signing_secrets.items():
+                if (
+                    service not in SERVICES
+                    or not isinstance(secret, str)
+                    or not secret.startswith("whsec_")
+                ):
+                    raise ValueError("Invalid receiver signing secret")
+                try:
+                    if len(base64.b64decode(secret[6:], validate=True)) < 16:
+                        raise ValueError()
+                except (ValueError, UnicodeError):
+                    raise ValueError("Invalid receiver signing secret") from None
+                new_secrets[service] = secret
+            changes["secrets"] = new_secrets
+        if not changes:
+            raise ValueError(
+                "Set RELAY_PROJECT_KEY or a receiver signing-secret environment variable"
+            )
+        with self.db() as db:
+            db.executemany(
+                "UPDATE configuration SET value=? WHERE key=?",
+                ((json.dumps(value), key) for key, value in changes.items()),
+            )
+            if resume_blocked:
+                return self._resume_blocked(db)
+        return 0
+
+    @staticmethod
+    def _resume_blocked(db):
+        return db.execute(
+            "UPDATE outbox SET blocked=0,next_attempt_at=0,last_error=NULL "
+            "WHERE event_id IS NULL AND blocked=1"
+        ).rowcount
+
+    def resume_blocked(self):
+        with self.db() as db:
+            return self._resume_blocked(db)
 
     def order(self, customer, quantity):
         if not isinstance(customer, str) or not 1 <= len(customer.strip()) <= 80:
@@ -117,7 +173,7 @@ class Storefront:
                 )
         return order_id
 
-    def send_pending(self, client, now=None, stop=None):
+    def send_pending(self, client=None, now=None, stop=None):
         clock = time.time if now is None else lambda: now
         with self.db() as db:
             rows = db.execute(
@@ -128,29 +184,55 @@ class Storefront:
         for row in rows:
             if stop is not None and stop.is_set():
                 break
+            sending_config = self.config() if client is None else None
+            sender = client or RelayClient(
+                sending_config["relay_url"],
+                sending_config["api_key"],
+                timeout=3,
+                max_retries=0,
+            )
             try:
-                receipt = client.emit(
+                receipt = sender.emit(
                     row["event_type"],
                     json.loads(row["payload"]),
                     idempotency_key=row["idempotency_key"],
                 )
+            except RelayEventExpired as exc:
+                # This confirms prior acceptance only, never successful delivery.
+                with self.db() as db:
+                    db.execute(
+                        "UPDATE outbox SET event_id=?,acceptance_expired=1,blocked=0,"
+                        "attempts=attempts+1,last_error=NULL WHERE id=?",
+                        (exc.event_id, row["id"]),
+                    )
             except RelayError as exc:
                 # Never replace a conflicting key: operators must inspect 4xx failures.
                 with self.db() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    credentials_changed = (
+                        sending_config is not None
+                        and json.loads(
+                            db.execute(
+                                "SELECT value FROM configuration WHERE key='api_key'"
+                            ).fetchone()[0]
+                        )
+                        != sending_config["api_key"]
+                    )
                     db.execute(
                         "UPDATE outbox SET attempts=attempts+1,next_attempt_at=?,last_error=?,blocked=? "
                         "WHERE id=? AND event_id IS NULL",
                         (
                             clock() + min(30, 2 ** min(row["attempts"], 5)),
                             str(exc),
-                            int(not exc.retryable),
+                            int(not exc.retryable and not credentials_changed),
                             row["id"],
                         ),
                     )
             else:
                 with self.db() as db:
                     db.execute(
-                        "UPDATE outbox SET event_id=?,attempts=attempts+1,last_error=NULL WHERE id=?",
+                        "UPDATE outbox SET event_id=?,acceptance_expired=0,blocked=0,"
+                        "attempts=attempts+1,last_error=NULL WHERE id=?",
                         (receipt["event"]["id"], row["id"]),
                     )
 
@@ -211,7 +293,9 @@ class Storefront:
                   EXISTS(SELECT 1 FROM fulfillment f WHERE f.order_id=o.id
                   AND f.service='accounting') AS accounting,
                   (SELECT count(*) FROM outbox x WHERE x.order_id=o.id
-                  AND x.event_id IS NULL) AS pending_events
+                  AND x.event_id IS NULL) AS pending_events,
+                  (SELECT count(*) FROM outbox x WHERE x.order_id=o.id
+                  AND x.acceptance_expired=1) AS expired_events
                 FROM orders o ORDER BY o.created_at DESC LIMIT 100
             """)
             ]
@@ -230,6 +314,9 @@ class Storefront:
                     "SELECT count(*) AS orders,coalesce(sum(total_cents),0) AS total_cents FROM orders"
                 ).fetchone()
             )
+            blocked_count = db.execute(
+                "SELECT count(*) FROM outbox WHERE event_id IS NULL AND blocked=1"
+            ).fetchone()[0]
         return {
             "configured": bool(config),
             "project_id": config.get("project_id"),
@@ -238,6 +325,7 @@ class Storefront:
             "orders": orders,
             "outbox": outbox,
             "totals": totals,
+            "blocked_count": blocked_count,
         }
 
 
@@ -246,10 +334,9 @@ def create_app(store, port=9000, run_sender=True):
     config = store.config()
 
     def send_loop():
-        client = RelayClient(config["relay_url"], config["api_key"], timeout=3, max_retries=0)
         while not stop.is_set():
             try:
-                store.send_pending(client, stop=stop)
+                store.send_pending(stop=stop)
             except (sqlite3.Error, ValueError):
                 # Keep the local example alive while a locked database recovers.
                 pass
@@ -350,12 +437,17 @@ def create_app(store, port=9000, run_sender=True):
             raise HTTPException(422, str(exc)) from None
         return {"ok": True}
 
+    @app.post("/api/outbox/resume")
+    async def resume_outbox():
+        return {"resumed": await asyncio.to_thread(store.resume_blocked)}
+
     @app.post("/hooks/{service}")
     async def receive(service: str, request: Request):
         if service not in SERVICES or not config:
             raise HTTPException(404, "Unknown receiver")
         raw = await body(request, 270000)
-        if not verify_signature(config["secrets"][service], raw, dict(request.headers)):
+        current_config = await asyncio.to_thread(store.config)
+        if not verify_signature(current_config["secrets"][service], raw, dict(request.headers)):
             raise HTTPException(401, "Invalid signature")
         if not await asyncio.to_thread(store.is_online, service):
             return JSONResponse({"detail": "Receiver is deliberately offline"}, 503)
@@ -439,14 +531,35 @@ def setup(store, relay_url, port):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["setup", "serve"])
+    parser.add_argument("command", choices=["setup", "serve", "credentials", "resume"])
     parser.add_argument("--db", default="data/storefront.db")
     parser.add_argument("--relay-url", default="http://127.0.0.1:8787")
     parser.add_argument("--port", type=int, default=9000)
+    parser.add_argument("--resume-blocked", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("Port must be between 1 and 65535")
     store = Storefront(args.db)
+    if args.command == "credentials":
+        try:
+            resumed = store.update_credentials(
+                os.environ.get("RELAY_PROJECT_KEY"),
+                {
+                    service: os.environ[name]
+                    for service in SERVICES
+                    if (name := f"RELAY_{service.upper()}_SIGNING_SECRET") in os.environ
+                },
+                args.resume_blocked,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(
+            f"Credentials updated. Resumed {resumed} blocked submissions with their original keys."
+        )
+        return
+    if args.command == "resume":
+        print(f"Resumed {store.resume_blocked()} blocked submissions with their original keys.")
+        return
     if args.command == "setup":
         try:
             setup(store, args.relay_url, args.port)

@@ -15,7 +15,7 @@ flowchart LR
 
 ## Acceptance
 
-An event is immutable. The API canonicalizes its data and inserts the event together with one delivery per currently enabled endpoint whose subscriptions match the event type. HTTP 202 is returned only after commit. If no endpoints are enabled, the event is retained with zero deliveries; later endpoint creation does not backfill it.
+An event is immutable. The API canonicalizes its data and inserts the event together with one delivery per currently enabled endpoint whose subscriptions match the event type. Admission uses the same serializer as delivery and rejects a normalized envelope over 256 KiB before inserting new events. The raw request has an independent 256 KiB bound. HTTP 202 is returned only after commit. If no endpoints are enabled, the event is retained with zero deliveries; later endpoint creation does not backfill it.
 
 An idempotency key is unique within a project. The same type and canonical data return the original event. Different content with the same key is rejected. Idempotency records remain as long as their events remain. After opt-in retention removes an event, a hashed-key tombstone preserves its event ID and request fingerprint for the configured post-purge window. Identical requests then receive HTTP 410; conflicting content receives HTTP 409. After the tombstone expires, the key can create a new event.
 
@@ -39,11 +39,12 @@ The worker signs the entire JSON envelope, including event ID, type, creation ti
 | Network error, timeout, HTTP 408/429/5xx | Retry if the cycle has attempts remaining |
 | Other HTTP status, including redirects | Mark failed |
 | Destination rejected by the network policy | Mark failed with a specific reason; do not retry |
+| Local resolver capacity exhausted | Release the fenced lease and defer with jitter; consume no attempt and do not penalize the endpoint |
 | Sixth unsuccessful attempt in a cycle | Mark failed |
 
 Backoff starts at two seconds, doubles per attempt, and adds 25% jitter. `Retry-After` can lengthen the delay, bounded at one hour, including arbitrarily long numeric values. Unexpected delivery exceptions are recorded as failed attempts and consume the retry budget.
 
-The total network attempt deadline is ten seconds, including DNS. Connection establishment and TLS handshakes have a shorter three-second budget within that deadline. A final HTTP 2xx response acknowledges delivery without requiring its body. Error-response excerpts are optional diagnostics capped at 4 KiB and a short read budget; a slow or malformed body does not erase an already received status. Three consecutive timeouts place the endpoint in a persisted 30-second cooldown. A subsequent non-timeout response clears the consecutive-timeout count.
+The total network attempt deadline is ten seconds, including DNS. Connection establishment and TLS handshakes have a shorter three-second budget within that deadline. A final HTTP 2xx response acknowledges delivery without requiring its body. Error-response excerpts are optional diagnostics capped at 4 KiB and a short read budget; a slow or malformed body does not erase an already received status. Endpoints with a timeout share one active probe allowance across worker processes. Three consecutive timeouts begin a persisted 30-second cooldown, doubling on subsequent timeouts up to ten minutes. A subsequent non-timeout result clears the streak. Unknown failures can still occupy worker slots until classified by a timeout.
 
 Delivery uses the Standard Webhooks signing format: `webhook-id.timestamp.body`, HMAC-SHA256, a base64-decoded `whsec_` secret, and `v1,<base64 signature>`. The verifier checks a five-minute timestamp tolerance and uses constant-time digest comparison. During an endpoint-secret rotation overlap, workers emit signatures for both the current and previous secrets using the same timestamp and body. Expired secrets are excluded. Project keys also support one previous credential during a bounded overlap; another rotation replaces that previous credential.
 
@@ -71,7 +72,7 @@ Every attempt resolves the hostname, checks every returned address, and connects
 
 The default policy rejects private, loopback, link-local, site-local, reserved, multicast, and mapped addresses, with explicit checks for special and IPv4-embedding ranges so older Python classification tables cannot silently weaken the boundary. Explicit private-network mode is intended for controlled internal deployments and the loopback demo.
 
-DNS calls run in a bounded pool of daemon threads because OS resolver calls cannot be reliably cancelled. Requests for the same hostname share outstanding resolution work, and failures are cached briefly with bounded memory use. Caller timeout does not release the underlying lookup's capacity until the OS call returns. This prevents one stalled hostname from filling the pool; many distinct stalled names remain a capacity limit.
+DNS calls run in eight bounded daemon-thread slots per process because OS resolver calls cannot be reliably cancelled. Requests for the same hostname share outstanding resolution work, and failures are cached briefly with bounded memory use. At most two new outstanding lookups belong to a delivery project, and delivery work can own six slots total, preserving two slots for operator requests. Caller timeout does not release a slot or its project ownership until the OS call returns. Local admission failures defer the fenced queue claim without creating an attempt; persistent aggregate counters expose that pressure. Many distinct stalled names across projects remain a capacity limit.
 
 ## Sessions and deployment origins
 

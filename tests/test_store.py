@@ -202,6 +202,113 @@ def test_project_and_endpoint_round_robin(store, project, endpoint):
     assert all(e == other_project_endpoint["id"] for p, e in claimed if p == other_project["id"])
 
 
+def test_failing_probe_capacity_is_shared_between_processes(store):
+    for index in range(4):
+        owner = store.create_project(f"Unavailable {index}")
+        store.create_endpoint(owner["id"], f"https://unavailable{index}.example/", rate_limit=1000)
+        store.create_event(owner["id"], "test", {})
+    with store._db(True) as db:
+        db.execute("UPDATE endpoints SET consecutive_timeouts=1")
+    with ProcessPoolExecutor(
+        max_workers=2, mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        claims = list(pool.map(_claim_in_process, [store.path] * 4))
+    jobs = [job for job in claims if job]
+    assert len(jobs) == 1 and jobs[0]["lease_is_probe"] == 1
+    assert Store(store.path).claim_delivery() is None
+    with store._db(True) as db:
+        db.execute("UPDATE deliveries SET lease_expires_at=0 WHERE id=?", (jobs[0]["id"],))
+    replacement = store.claim_delivery()
+    assert replacement is not None and replacement["lease_is_probe"] == 1
+
+
+def test_deferral_is_fenced_and_preserves_retry_history(store, project, endpoint):
+    submit(store, project)
+    first = store.claim_delivery()
+    finish(store, first, 503, 0)
+    with store._db(True) as db:
+        db.execute("UPDATE endpoints SET next_available_at=0")
+    stale = store.claim_delivery()
+    with store._db(True) as db:
+        db.execute("UPDATE deliveries SET lease_expires_at=0")
+        db.execute("UPDATE endpoints SET next_available_at=0")
+    assert not store.defer_delivery(stale["id"], stale["lease_token"], reason="dns_global_capacity")
+    current = Store(store.path).claim_delivery()
+    assert not store.defer_delivery(
+        stale["id"], stale["lease_token"], reason="dns_project_capacity"
+    )
+    assert not store.deferral_stats()
+    before = time.time()
+    assert store.defer_delivery(
+        current["id"], current["lease_token"], reason="dns_project_capacity", retry_after_seconds=2
+    )
+    row = store.delivery_detail(project["id"], current["id"])
+    assert row["status"] == "retrying" and row["attempt_count"] == row["cycle_attempts"] == 1
+    assert len(row["attempts"]) == 1 and row["last_status_code"] == 503
+    assert row["next_attempt_at"] >= before + 2
+    assert not finish(store, current)
+    assert store.deferral_stats()["dns_project_capacity"]["count"] == 1
+
+
+def test_endpoint_cooldown_grows_is_bounded_and_resets_after_response(
+    store, project, endpoint, monkeypatch
+):
+    now = time.time()
+    monkeypatch.setattr(module.time, "time", lambda: now)
+    submit(store, project)
+    for expected_delay in [0, 0, 30, 60, 120, 240, 480, 600, 600]:
+        claim = store.claim_delivery()
+        assert claim is not None
+        assert store.complete_delivery(
+            claim["id"],
+            claim["lease_token"],
+            status_code=None,
+            error="Timeout",
+            duration_ms=10000,
+            response_excerpt="",
+            next_attempt_at=now,
+            max_attempts=20,
+            timed_out=True,
+        )
+        with store._db() as db:
+            until = db.execute("SELECT cooldown_until FROM endpoints").fetchone()[0]
+        assert max(0, until - now) == expected_delay
+        if expected_delay:
+            assert store.claim_delivery() is None
+        now += expected_delay + 1
+    claim = store.claim_delivery()
+    assert finish(store, claim, 204)
+    with store._db() as db:
+        assert tuple(
+            db.execute("SELECT consecutive_timeouts,cooldown_until FROM endpoints").fetchone()
+        ) == (0, 0)
+
+
+def test_v3_migration_adds_probe_and_deferral_state_without_changing_history(
+    store, project, endpoint
+):
+    event = submit(store, project)
+    claim = store.claim_delivery()
+    assert finish(store, claim)
+    with store._db(True) as db:
+        db.execute("DROP INDEX deliveries_processing_probes")
+        db.execute("ALTER TABLE deliveries DROP COLUMN lease_is_probe")
+        db.execute("DROP TABLE delivery_deferrals")
+        db.execute("PRAGMA user_version=3")
+    store.initialize()
+    store.initialize()
+    assert store.get_event(project["id"], event["id"])["payload"] == {"order_id": 12}
+    assert (
+        store.delivery_detail(project["id"], claim["id"])["attempts"][0]["endpoint_url"]
+        == endpoint["url"]
+    )
+    assert store.authenticate_project(project["api_key"])
+    assert store.deferral_stats() == {}
+    with store._db() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == module.SCHEMA_VERSION
+        assert db.execute("SELECT lease_is_probe FROM deliveries").fetchone()[0] == 0
+
+
 def test_unhealthy_project_cannot_occupy_all_capacity(store, project, endpoint):
     for number in range(6):
         store.create_endpoint(

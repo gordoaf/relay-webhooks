@@ -1,6 +1,6 @@
 {
   "name": "@relay-webhooks/client",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Typed Relay ingestion client and raw-body webhook verification for Node.js",
   "type": "module",
   "main": "./index.js",

@@ -233,4 +233,4 @@ def test_v2_migration_preserves_legacy_data_without_inventing_attempt_destinatio
     assert migrated.delivery_detail("prj_old", "dlv_old")["attempts"][0]["endpoint_url"] is None
     assert migrated.create_event("prj_old", "test", {}, "unique")[1] is False
     with migrated._db() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == store_module.SCHEMA_VERSION

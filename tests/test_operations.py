@@ -371,6 +371,30 @@ def test_failure_alert_requires_enough_samples_and_recovers(store):
     assert not ops.list_alerts()[0]["active"]
 
 
+def test_resource_deferrals_are_visible_without_becoming_delivery_failures(
+    store, project, endpoint
+):
+    store.create_event(project["id"], "order.created", {})
+    job = store.claim_delivery()
+    assert store.defer_delivery(job["id"], job["lease_token"], reason="dns_global_capacity")
+    ops = Operations(store)
+    snapshot = ops.summary()
+    assert snapshot["resources"]["scope"] == "instance"
+    assert snapshot["resources"]["delivery_deferrals"]["dns_global_capacity"]["count"] == 1
+    assert snapshot["resources"]["delivery_deferrals"]["dns_project_capacity"]["count"] == 0
+    assert snapshot["outcomes"]["attempts"] == 0
+    assert snapshot["endpoints"]["cooling_down"] == 0
+    ops.evaluate_alerts(snapshot)
+    assert "resolver_capacity" in [alert["code"] for alert in ops.list_alerts() if alert["active"]]
+    last_seen = snapshot["resources"]["delivery_deferrals"]["dns_global_capacity"]["last_seen_at"]
+    expired = ops.summary(now=last_seen + module.RESOURCE_PRESSURE_SECONDS + 1)
+    assert not expired["resources"]["pressure_recent"]
+    metrics = ops.prometheus()
+    assert "# TYPE relay_delivery_deferrals_total counter" in metrics
+    assert 'relay_delivery_deferrals_total{reason="dns_global_capacity"} 1' in metrics
+    assert project["id"] not in metrics and endpoint["url"] not in metrics
+
+
 def test_alert_transitions_deduplicate_recover_and_hide_secrets(store, monkeypatch):
     ops = alert_operations(store, alert_cooldown_seconds=60)
     snapshot = quiet_snapshot(ops)
@@ -393,7 +417,8 @@ def test_alert_transitions_deduplicate_recover_and_hide_secrets(store, monkeypat
     assert delivered[0]["id"] != delivered[1]["id"]
     snapshot["queue"]["runnable_oldest_age_seconds"] = 0
     ops.evaluate_alerts(snapshot, now=180)
-    assert ops.notify_once(now=180)
+    assert not ops.notify_once(now=180)
+    assert ops.notify_once(now=230)
     assert delivered[-1]["type"] == "relay.alert.resolved"
     assert not ops.notify_once(now=1000)
     assert ops.list_alerts()[0]["resolved_at"] == 180
@@ -447,8 +472,272 @@ def test_notification_lease_fences_parallel_senders_and_old_transition(store, mo
         assert first.result()
     alert = other.list_alerts()[0]
     assert not alert["active"] and alert["last_notified_at"] is None
-    assert other.notify_once(now=103)
-    assert other.list_alerts()[0]["last_notified_at"] == 103
+    assert not other.notify_once(now=103)
+    assert other.notify_once(now=3700)
+    assert other.list_alerts()[0]["last_notified_at"] == 3700
+
+
+def test_flapping_alerts_coalesce_across_restarts_and_send_latest_state(store, monkeypatch):
+    ops = alert_operations(store)
+    snapshot = quiet_snapshot(ops)
+    sent = []
+
+    def sender(url, body, headers, **kwargs):
+        sent.append(json.loads(body))
+        return DeliveryResult(204, None, 1, "")
+
+    monkeypatch.setattr(module, "deliver", sender)
+    for index in range(20):
+        if index == 10:
+            ops = alert_operations(Store(store.path))
+        snapshot["queue"]["runnable_oldest_age_seconds"] = 500 if index % 2 == 0 else 0
+        stamp = 100 + index * 30
+        ops.evaluate_alerts(snapshot, now=stamp)
+        ops.notify_once(now=stamp)
+    assert len(sent) == 1 and sent[0]["type"] == "relay.alert.active"
+    assert not ops.list_alerts()[0]["active"]
+    assert ops.list_alerts()[0]["next_notification_at"] == 3700
+    assert not ops.notify_once(now=3699)
+    assert ops.notify_once(now=3700)
+    assert sent[-1]["type"] == "relay.alert.resolved"
+    assert sent[-1]["created_at"] == 670
+
+
+def test_failed_notification_does_not_allow_flapping_to_reset_rate_limit(store, monkeypatch):
+    ops = alert_operations(store)
+    snapshot = quiet_snapshot(ops)
+    sent = []
+    monkeypatch.setattr(
+        module,
+        "deliver",
+        lambda *args, **kwargs: sent.append(None) or DeliveryResult(503, None, 1, ""),
+    )
+    for index in range(20):
+        snapshot["queue"]["runnable_oldest_age_seconds"] = 500 if index % 2 == 0 else 0
+        stamp = 100 + index * 30
+        ops.evaluate_alerts(snapshot, now=stamp)
+        ops.notify_once(now=stamp)
+    assert len(sent) == 1
+    assert ops.list_alerts()[0]["notification_gate_until"] == 3700
+
+
+def test_notification_retry_claims_survive_sender_crashes(store, monkeypatch):
+    ops = alert_operations(store)
+    snapshot = quiet_snapshot(ops)
+    snapshot["queue"]["runnable_oldest_age_seconds"] = 500
+    ops.evaluate_alerts(snapshot, now=100)
+    sent = []
+
+    def crash(*args, **kwargs):
+        sent.append(None)
+        raise SystemExit("Simulated process termination after claim")
+
+    monkeypatch.setattr(module, "deliver", crash)
+    for stamp in (100, 116, 132):
+        with pytest.raises(SystemExit):
+            alert_operations(Store(store.path)).notify_once(now=stamp)
+    assert ops.list_alerts()[0]["notification_attempts"] == 3
+    assert ops.notify_once(now=148)
+    assert not ops.notify_once(now=149)
+    assert len(sent) == 3
+
+
+def test_dns_capacity_defers_notifications_without_spending_retry_budget(store, monkeypatch):
+    ops = alert_operations(store)
+    snapshot = quiet_snapshot(ops)
+    snapshot["queue"]["runnable_oldest_age_seconds"] = 500
+    ops.evaluate_alerts(snapshot, now=100)
+    monkeypatch.setattr(
+        module,
+        "deliver",
+        lambda *args, **kwargs: DeliveryResult(
+            None, "Local capacity", 0, "", deferred_reason="dns_global_capacity"
+        ),
+    )
+    for stamp in range(100, 130, 5):
+        assert ops.notify_once(now=stamp)
+        alert = ops.list_alerts()[0]
+        assert alert["notification_attempts"] == 0
+        assert alert["notification_gate_until"] == 0
+        assert alert["last_notified_at"] is None
+        assert not ops.notify_once(now=stamp + 1)
+    with store._db() as db:
+        assert db.execute("SELECT notification_cycle FROM operation_alerts").fetchone()[0] == 0
+    monkeypatch.setattr(module, "deliver", lambda *args, **kwargs: DeliveryResult(204, None, 1, ""))
+    assert ops.notify_once(now=130)
+    assert ops.list_alerts()[0]["last_notified_at"] == 130
+
+
+def test_dns_deferral_releases_only_its_gate_after_an_alert_transition(store, monkeypatch):
+    ops = alert_operations(store)
+    snapshot = quiet_snapshot(ops)
+    snapshot["queue"]["runnable_oldest_age_seconds"] = 500
+    ops.evaluate_alerts(snapshot, now=100)
+
+    def deferred(*args, **kwargs):
+        snapshot["queue"]["runnable_oldest_age_seconds"] = 0
+        ops.evaluate_alerts(snapshot, now=101)
+        return DeliveryResult(None, "Local capacity", 0, "", deferred_reason="dns_project_capacity")
+
+    monkeypatch.setattr(module, "deliver", deferred)
+    assert ops.notify_once(now=100)
+    alert = ops.list_alerts()[0]
+    assert not alert["active"] and alert["notification_attempts"] == 0
+    assert alert["notification_gate_until"] == 0
+    assert alert["next_notification_at"] == 105
+    monkeypatch.setattr(module, "deliver", lambda *args, **kwargs: DeliveryResult(204, None, 1, ""))
+    assert ops.notify_once(now=105)
+
+
+def test_operations_migrate_existing_schema3_alerts_without_resetting_state(store):
+    ops = alert_operations(store)
+    snapshot = quiet_snapshot(ops)
+    snapshot["queue"]["runnable_oldest_age_seconds"] = 500
+    ops.evaluate_alerts(snapshot, now=100)
+    with store._db(True) as db:
+        db.execute("UPDATE operation_alerts SET last_notified_at=100,next_notification_at=3700")
+        db.execute("ALTER TABLE operation_alerts DROP COLUMN notification_gate_until")
+        db.execute("ALTER TABLE operation_alerts DROP COLUMN notification_version")
+        db.execute("PRAGMA user_version=3")
+    reopened = Store(store.path)
+    reopened.initialize()
+    migrated = alert_operations(reopened)
+    assert migrated.list_alerts()[0]["active"]
+    assert migrated.list_alerts()[0]["first_seen_at"] == 100
+    snapshot["queue"]["runnable_oldest_age_seconds"] = 0
+    migrated.evaluate_alerts(snapshot, now=110)
+    assert not migrated.notify_once(now=110)
+    assert migrated.list_alerts()[0]["next_notification_at"] == 3700
+
+
+def seed_terminal_history(store, project, endpoint, count):
+    with store._db(True) as db:
+        db.executemany(
+            "INSERT INTO events VALUES(?,?, 'finished','{}',NULL,2)",
+            [(f"done-{index:06}", project["id"]) for index in range(count)],
+        )
+        db.executemany(
+            """INSERT INTO deliveries(id,project_id,event_id,endpoint_id,status,created_at,updated_at)
+                          VALUES(?,?,?,?,'delivered',2,2)""",
+            [
+                (f"done-delivery-{index:06}", project["id"], f"done-{index:06}", endpoint["id"])
+                for index in range(count)
+            ],
+        )
+        db.execute("""INSERT INTO attempts(delivery_id,attempt_number,cycle_attempt,status_code,duration_ms,
+                    response_excerpt,started_at,finished_at,created_at)
+                    SELECT id,1,1,204,1,'',2,2,2 FROM deliveries WHERE status='delivered'""")
+
+
+def test_cleanup_burst_drains_multiple_batches_and_releases_writer_between_them(
+    store, project, endpoint, monkeypatch
+):
+    seed_terminal_history(store, project, endpoint, 600)
+    ops = Operations(store, OperationsPolicy(retention_days=1))
+    monkeypatch.setattr(module.time, "monotonic", lambda: 0)
+    writes = []
+
+    def competing_writer(_):
+        # This would time out if cleanup retained its writer reservation between batches.
+        with store._db(True) as db:
+            db.execute("UPDATE projects SET name=name WHERE id=?", (project["id"],))
+        writes.append(None)
+        return False
+
+    monkeypatch.setattr(ops._stopping, "wait", competing_writer)
+    result = ops.cleanup_burst(now=200000)
+    assert result["deleted_events"] == 600
+    assert result["deleted_attempts"] == 600
+    assert result["passes"] == 6 and len(writes) == 5
+    assert not result["catch_up"]
+
+
+def test_cleanup_burst_passes_parked_prefix_without_waiting_30_seconds_per_window(
+    store, project, endpoint, monkeypatch
+):
+    seed_parked_events(store, project, endpoint, 20000)
+    seed_terminal_history(store, project, endpoint, 100)
+    ops = Operations(store, OperationsPolicy(retention_days=1))
+    monkeypatch.setattr(module.time, "monotonic", lambda: 0)
+    result = ops.cleanup_burst(now=200000)
+    assert result["passes"] == 21 and result["deleted_events"] == 100
+    assert not result["catch_up"]
+    with store._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 20000
+
+
+def test_cleanup_burst_stops_after_no_progress_full_scan(store, project, endpoint, monkeypatch):
+    seed_parked_events(store, project, endpoint, 1000)
+    ops = Operations(store, OperationsPolicy(retention_days=1))
+    monkeypatch.setattr(module.time, "monotonic", lambda: 0)
+    result = ops.cleanup_burst(now=200000)
+    assert result["passes"] == 2 and not result["catch_up"]
+    assert result["deleted_events"] == 0
+
+
+def test_cleanup_burst_drains_terminal_windows_after_parked_prefix(
+    store, project, endpoint, monkeypatch
+):
+    seed_parked_events(store, project, endpoint, 1000)
+    seed_terminal_history(store, project, endpoint, 2000)
+    monkeypatch.setattr(module.time, "monotonic", lambda: 0)
+    # The first burst ends in a partially drained window. A different process
+    # must resume that same window instead of advancing to the next 1,000 IDs.
+    monkeypatch.setattr(module, "CLEANUP_BURST_MAX_BATCHES", 4)
+    ops = Operations(store, OperationsPolicy(retention_days=1))
+    result = ops.cleanup_burst(now=200000)
+    assert result["deleted_events"] == 300 and result["catch_up"]
+    assert result["passes"] == 4
+    monkeypatch.setattr(module, "CLEANUP_BURST_MAX_BATCHES", 50)
+    resumed = Operations(Store(store.path), OperationsPolicy(retention_days=1))
+    result = resumed.cleanup_burst(now=200000)
+    assert result["deleted_events"] == 1700
+    assert not result["catch_up"]
+    with store._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1000
+        assert db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+
+
+def unfinished_cleanup(**kwargs):
+    return {
+        "deleted_events": 0,
+        "deleted_deliveries": 0,
+        "deleted_attempts": 0,
+        "deleted_tombstones": 0,
+        "scanned_events": 1000,
+        "scan_wrapped": False,
+        "has_more": True,
+    }
+
+
+def test_cleanup_burst_enforces_pass_and_soft_time_budgets(store, monkeypatch):
+    ops = Operations(store)
+    monkeypatch.setattr(ops, "cleanup", unfinished_cleanup)
+    monkeypatch.setattr(ops._stopping, "wait", lambda _: False)
+    monkeypatch.setattr(module.time, "monotonic", lambda: 0)
+    assert ops.cleanup_burst()["passes"] == module.CLEANUP_BURST_MAX_BATCHES
+    stamps = iter((0, 0.1, 0.21, 0.21))
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(stamps))
+    result = ops.cleanup_burst()
+    assert result["passes"] == 2 and result["elapsed_ms"] == 210
+    assert result["catch_up"]
+
+
+def test_catchup_is_shared_across_processes_without_extra_monitoring_scans(store, monkeypatch):
+    first, second = Operations(store), Operations(Store(store.path))
+    scans = []
+    for ops in (first, second):
+        monkeypatch.setattr(ops, "cleanup_burst", lambda **kwargs: {"catch_up": True})
+        monkeypatch.setattr(ops, "summary", lambda **kwargs: {})
+        monkeypatch.setattr(ops, "evaluate_alerts", lambda *args, **kwargs: scans.append(None))
+    monkeypatch.setattr(module.time, "monotonic", lambda: 0)
+    assert first.run_once(now=100)
+    assert not second.run_once(now=100.5)
+    assert second.run_once(now=101)
+    assert len(scans) == 1
+    assert second._maintenance_delay == 1
+    assert first.run_once(now=130)
+    assert len(scans) == 2
 
 
 def test_maintenance_lease_and_threads_do_not_take_delivery_slots(store):

@@ -18,6 +18,12 @@ logger = logging.getLogger(__name__)
 WINDOW_SECONDS = 3600
 MAX_NOTIFICATION_ATTEMPTS = 3
 RETENTION_SCAN_LIMIT = 1000
+CLEANUP_BURST_SECONDS = 0.2
+CLEANUP_BURST_MAX_BATCHES = 50
+CLEANUP_CATCHUP_SECONDS = 1
+CLEANUP_BATCH_YIELD_SECONDS = 0.001
+RESOURCE_REASONS = ("dns_global_capacity", "dns_project_capacity")
+RESOURCE_PRESSURE_SECONDS = 60
 OPERATIONS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS idempotency_tombstones (
  project_id TEXT NOT NULL REFERENCES projects(id), key_hash TEXT NOT NULL,
@@ -36,7 +42,9 @@ CREATE TABLE IF NOT EXISTS operation_alerts (
  resolved_at REAL, version INTEGER NOT NULL DEFAULT 1,
  notification_attempts INTEGER NOT NULL DEFAULT 0, next_notification_at REAL,
  lease_token TEXT, lease_expires_at REAL, last_notified_at REAL,
- last_notification_status TEXT, notification_cycle INTEGER NOT NULL DEFAULT 0
+ last_notification_status TEXT, notification_cycle INTEGER NOT NULL DEFAULT 0,
+ notification_gate_until REAL NOT NULL DEFAULT 0,
+ notification_version INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS operation_leases (
  name TEXT PRIMARY KEY, token TEXT NOT NULL, expires_at REAL NOT NULL
@@ -52,6 +60,13 @@ def initialize_operations(db):
     for statement in OPERATIONS_SCHEMA.split(";"):
         if statement.strip():
             db.execute(statement)
+    existing = {row["name"] for row in db.execute("PRAGMA table_info(operation_alerts)")}
+    for name, definition in {
+        "notification_gate_until": "REAL NOT NULL DEFAULT 0",
+        "notification_version": "INTEGER NOT NULL DEFAULT 0",
+    }.items():
+        if name not in existing:
+            db.execute(f"ALTER TABLE operation_alerts ADD COLUMN {name} {definition}")
 
 
 class IdempotencyExpired(RuntimeError):
@@ -177,6 +192,7 @@ class Operations:
         self._stopping = threading.Event()
         self._lifecycle = threading.Lock()
         self._threads = []
+        self._maintenance_delay = self.policy.interval_seconds
 
     def storage(self, db=None):
         if db is None:
@@ -259,6 +275,13 @@ class Operations:
                 + scope,
                 [now, *args],
             ).fetchone()
+            deferrals = {reason: {"count": 0, "last_seen_at": 0} for reason in RESOURCE_REASONS}
+            for row in db.execute("SELECT reason,count,last_seen_at FROM delivery_deferrals"):
+                if row["reason"] in deferrals:
+                    deferrals[row["reason"]] = {
+                        "count": row["count"],
+                        "last_seen_at": row["last_seen_at"],
+                    }
             storage = self.storage(db)
         policy = asdict(self.policy)
         policy.pop("alert_signing_secret")
@@ -285,6 +308,14 @@ class Operations:
             },
             "endpoints": dict(endpoints),
             "storage": storage,
+            "resources": {
+                "scope": "instance",
+                "delivery_deferrals": deferrals,
+                "pressure_recent": any(
+                    value["count"] and value["last_seen_at"] >= now - RESOURCE_PRESSURE_SECONDS
+                    for value in deferrals.values()
+                ),
+            },
             "policy": policy,
             "alerts": self.list_alerts(),
         }
@@ -339,6 +370,24 @@ class Operations:
             lines.extend([f"# HELP {name} {help_text}", f"# TYPE {name} gauge", f"{name} {value}"])
         lines.extend(
             [
+                "# HELP relay_delivery_deferrals_total Delivery deferrals caused by local DNS capacity, without consuming an attempt.",
+                "# TYPE relay_delivery_deferrals_total counter",
+            ]
+        )
+        for reason, values in snapshot["resources"]["delivery_deferrals"].items():
+            lines.append(f'relay_delivery_deferrals_total{{reason="{reason}"}} {values["count"]}')
+        lines.extend(
+            [
+                "# HELP relay_delivery_last_deferral_timestamp_seconds Unix timestamp of the last local DNS capacity deferral.",
+                "# TYPE relay_delivery_last_deferral_timestamp_seconds gauge",
+            ]
+        )
+        for reason, values in snapshot["resources"]["delivery_deferrals"].items():
+            lines.append(
+                f'relay_delivery_last_deferral_timestamp_seconds{{reason="{reason}"}} {values["last_seen_at"]}'
+            )
+        lines.extend(
+            [
                 "# HELP relay_alert_active Current operator alert state.",
                 "# TYPE relay_alert_active gauge",
             ]
@@ -366,6 +415,7 @@ class Operations:
             "scanned_events": 0,
             "scan_limit": RETENTION_SCAN_LIMIT,
             "has_more": False,
+            "scan_wrapped": False,
         }
         with self.store._db(write=not dry_run) as db:
             if dry_run:
@@ -377,6 +427,7 @@ class Operations:
                      ORDER BY expires_at LIMIT ?)""",
                     (now, batch),
                 ).rowcount
+                result["has_more"] = result["deleted_tombstones"] == batch
             if not self.policy.retention_days:
                 return result
             cutoff = now - self.policy.retention_days * 86400
@@ -396,6 +447,7 @@ class Operations:
 
             window = scan(cursor)
             if not window and cursor != (-1e30, ""):
+                result["scan_wrapped"] = True
                 cursor = (-1e30, "")
                 window = scan(cursor)
             result["scanned_events"] = len(window)
@@ -425,7 +477,8 @@ class Operations:
                 ORDER BY ev.created_at,ev.id LIMIT ?""",
                 (*cursor, *boundary, cutoff, batch + 1),
             ).fetchall()
-            result["has_more"] = len(candidates) > batch or len(window) == RETENTION_SCAN_LIMIT
+            window_has_more = len(candidates) > batch
+            result["has_more"] |= window_has_more or len(window) == RETENTION_SCAN_LIMIT
             candidates = candidates[:batch]
             result["eligible_events"] = len(candidates)
             if dry_run or not candidates:
@@ -459,6 +512,7 @@ class Operations:
                     "SELECT 1 FROM deliveries WHERE event_id=? LIMIT 1", (row["id"],)
                 ).fetchone():
                     result["has_more"] = True
+                    window_has_more = True
                     continue
                 if row["idempotency_key"] is not None:
                     event = db.execute(
@@ -480,13 +534,75 @@ class Operations:
                 result["deleted_events"] += db.execute(
                     "DELETE FROM events WHERE id=?", (row["id"],)
                 ).rowcount
+            if window_has_more:
+                # Finish this window before moving past it. Advancing after a
+                # partial batch skips eligible rows and can mistake a parked
+                # prefix on the next wrap for a completed scan. Persisting the
+                # cursor also keeps catch-up correct across processes/bursts.
+                db.execute(
+                    "UPDATE operation_cursors SET created_at=?,event_id=? WHERE name='retention'",
+                    cursor,
+                )
         return result
+
+    def cleanup_burst(self, now=None):
+        """Catch up using short transactions, bounded time and a bounded pass count.
+
+        The time budget is checked between batches; one SQLite operation may
+        overrun it while waiting for a writer. Each batch retains its row limits.
+        """
+        now = time.time() if now is None else now
+        started = time.monotonic()
+        totals = {
+            name: 0
+            for name in (
+                "deleted_events",
+                "deleted_deliveries",
+                "deleted_attempts",
+                "deleted_tombstones",
+                "scanned_events",
+                "passes",
+            )
+        }
+        catch_up = False
+        for _ in range(CLEANUP_BURST_MAX_BATCHES):
+            if self._stopping.is_set():
+                break
+            result = self.cleanup(dry_run=False, now=now)
+            totals["passes"] += 1
+            for name in totals:
+                if name != "passes":
+                    totals[name] += result[name]
+            progressed = any(
+                result[name]
+                for name in (
+                    "deleted_events",
+                    "deleted_deliveries",
+                    "deleted_attempts",
+                    "deleted_tombstones",
+                )
+            )
+            # A full scan of parked/ineligible history is not useful work to
+            # repeat at catch-up speed. Resume ordinary polling after a wrap.
+            catch_up = result["has_more"] and not (result["scan_wrapped"] and not progressed)
+            if not catch_up or time.monotonic() - started >= CLEANUP_BURST_SECONDS:
+                break
+            # The preceding transaction is closed before yielding to ingress and
+            # delivery writers. A process-wide maintenance lease bounds all peers.
+            if self._stopping.wait(CLEANUP_BATCH_YIELD_SECONDS):
+                break
+        return {
+            **totals,
+            "catch_up": catch_up,
+            "elapsed_ms": round((time.monotonic() - started) * 1000, 2),
+        }
 
     def list_alerts(self):
         with self.store._db() as db:
             rows = db.execute(
                 """SELECT code,severity,active,message,first_seen_at,updated_at,resolved_at,
-                last_notified_at,notification_attempts,last_notification_status
+                last_notified_at,notification_attempts,last_notification_status,
+                notification_gate_until,next_notification_at
                 FROM operation_alerts ORDER BY active DESC,code"""
             ).fetchall()
         return [{**dict(row), "active": bool(row["active"])} for row in rows]
@@ -526,6 +642,11 @@ class Operations:
                 "warning",
                 "A destination is in timeout cooldown. Check its connectivity and response time.",
             ),
+            "resolver_capacity": (
+                snapshot.get("resources", {}).get("pressure_recent", False),
+                "warning",
+                "Local DNS lookup capacity is exhausted. Deliveries are being deferred without consuming attempts; check resolver health and stalled destinations.",
+            ),
         }
         with self.store._db(True) as db:
             for code, (active, severity, message) in conditions.items():
@@ -540,6 +661,15 @@ class Operations:
                             (code, severity, message, now, now, now),
                         )
                 elif bool(previous["active"]) != active:
+                    # Keep the send gate across versions. A flapping condition
+                    # updates dashboard state immediately and replaces its queued
+                    # notification, without opening another notification cycle.
+                    gate = max(
+                        previous["notification_gate_until"],
+                        (previous["last_notified_at"] or 0) + self.policy.alert_cooldown_seconds
+                        if previous["last_notified_at"] is not None
+                        else 0,
+                    )
                     db.execute(
                         """UPDATE operation_alerts SET active=?,message=?,first_seen_at=?,updated_at=?,resolved_at=?,
                         version=version+1,notification_cycle=0,notification_attempts=0,next_notification_at=?,lease_token=NULL,
@@ -550,7 +680,7 @@ class Operations:
                             now if active else previous["first_seen_at"],
                             now,
                             None if active else now,
-                            now,
+                            max(now, gate),
                             code,
                         ),
                     )
@@ -564,14 +694,38 @@ class Operations:
             row = db.execute(
                 """SELECT * FROM operation_alerts WHERE next_notification_at<=?
                 AND (lease_expires_at IS NULL OR lease_expires_at<=?)
+                AND ((notification_version=version AND notification_attempts>0)
+                     OR notification_gate_until<=?)
                 ORDER BY next_notification_at,code LIMIT 1""",
-                (now, now),
+                (now, now, now),
             ).fetchone()
             if row is None:
                 return False
+            row = dict(row)
+            if row["notification_attempts"] >= MAX_NOTIFICATION_ATTEMPTS:
+                # Count claims, not just completed requests: repeated process
+                # crashes after sending must not create an unlimited retry cycle.
+                gate = max(row["notification_gate_until"], now + self.policy.alert_cooldown_seconds)
+                db.execute(
+                    """UPDATE operation_alerts SET notification_attempts=0,
+                    notification_gate_until=?,next_notification_at=?,notification_cycle=notification_cycle+1,
+                    lease_token=NULL,lease_expires_at=NULL,last_notification_status='failed' WHERE code=?""",
+                    (gate, gate if row["active"] else None, row["code"]),
+                )
+                return True
+            retrying = (
+                row["notification_version"] == row["version"] and row["notification_attempts"] > 0
+            )
+            gate = (
+                row["notification_gate_until"]
+                if retrying
+                else now + self.policy.alert_cooldown_seconds
+            )
+            attempts = row["notification_attempts"] + 1
             db.execute(
-                "UPDATE operation_alerts SET lease_token=?,lease_expires_at=? WHERE code=?",
-                (token, now + 15, row["code"]),
+                """UPDATE operation_alerts SET lease_token=?,lease_expires_at=?,
+                notification_gate_until=?,notification_version=version,notification_attempts=? WHERE code=?""",
+                (token, now + 15, gate, attempts, row["code"]),
             )
         event_id = f"alert_{row['code']}_{row['version']}_{row['notification_cycle']}"
         payload = {
@@ -594,6 +748,37 @@ class Operations:
                 timeout=5,
                 allow_private=self.allow_private,
             )
+            if result.deferred_reason in RESOURCE_REASONS:
+                # No request was made. Undo this claim's retry charge and gate
+                # reservation, including when a newer state replaced its version
+                # while DNS was being checked. A later sender's claim is fenced.
+                with self.store._db(True) as db:
+                    db.execute(
+                        """UPDATE operation_alerts SET
+                        notification_attempts=CASE WHEN version=? THEN ? ELSE notification_attempts END,
+                        notification_version=CASE WHEN version=? THEN ? ELSE notification_version END,
+                        notification_gate_until=?,next_notification_at=CASE WHEN version=? THEN ? ELSE MAX(?,?) END,
+                        lease_token=NULL,lease_expires_at=NULL,last_notification_status='deferred: DNS capacity'
+                        WHERE code=? AND notification_version=? AND notification_gate_until=?
+                        AND (lease_token=? OR version!=?)""",
+                        (
+                            row["version"],
+                            row["notification_attempts"],
+                            row["version"],
+                            row["notification_version"],
+                            row["notification_gate_until"],
+                            row["version"],
+                            now + 5,
+                            now + 5,
+                            row["notification_gate_until"],
+                            row["code"],
+                            row["version"],
+                            gate,
+                            token,
+                            row["version"],
+                        ),
+                    )
+                return True
             success = result.status_code is not None and 200 <= result.status_code < 300
             permanent = result.permanent or (
                 result.status_code is not None
@@ -604,9 +789,9 @@ class Operations:
         except Exception:
             logger.exception("Operator notification failed")
             success, permanent, retry_after = False, False, 0
-        attempts = row["notification_attempts"] + 1
         if success or permanent or attempts >= MAX_NOTIFICATION_ATTEMPTS:
-            next_at = now + self.policy.alert_cooldown_seconds if row["active"] else None
+            gate = max(gate, now + self.policy.alert_cooldown_seconds)
+            next_at = gate if row["active"] else None
             next_attempts = 0
         else:
             next_at = now + max(30 * 2 ** (attempts - 1), retry_after)
@@ -615,7 +800,8 @@ class Operations:
             db.execute(
                 """UPDATE operation_alerts SET notification_attempts=?,next_notification_at=?,
                 last_notification_status=?,last_notified_at=CASE WHEN ? THEN ? ELSE last_notified_at END,
-                notification_cycle=notification_cycle+?,lease_token=NULL,lease_expires_at=NULL
+                notification_cycle=notification_cycle+?,notification_gate_until=?,
+                lease_token=NULL,lease_expires_at=NULL
                 WHERE code=? AND version=? AND lease_token=?""",
                 (
                     next_attempts,
@@ -624,6 +810,7 @@ class Operations:
                     int(success),
                     now,
                     int(next_attempts == 0),
+                    gate,
                     row["code"],
                     row["version"],
                     token,
@@ -633,7 +820,9 @@ class Operations:
 
     def run_once(self, now=None):
         now = time.time() if now is None else now
+        started = time.monotonic()
         token = secrets.token_hex(16)
+        self._maintenance_delay = self.policy.interval_seconds
         with self.store._db(True) as db:
             claimed = db.execute(
                 """INSERT INTO operation_leases(name,token,expires_at) VALUES('maintenance',?,?)
@@ -641,16 +830,31 @@ class Operations:
                 WHERE operation_leases.expires_at<=?""",
                 (token, now + 60, now),
             ).rowcount
+            if claimed:
+                monitor = db.execute(
+                    """INSERT INTO operation_leases(name,token,expires_at) VALUES('monitoring',?,?)
+                    ON CONFLICT(name) DO UPDATE SET token=excluded.token,expires_at=excluded.expires_at
+                    WHERE operation_leases.expires_at<=?""",
+                    (token, now + self.policy.interval_seconds, now),
+                ).rowcount
+            else:
+                expiry = db.execute(
+                    "SELECT expires_at FROM operation_leases WHERE name='maintenance'"
+                ).fetchone()[0]
+                self._maintenance_delay = max(0.1, min(self.policy.interval_seconds, expiry - now))
         if not claimed:
             return False
         try:
-            self.cleanup(dry_run=False, now=now)
-            self.evaluate_alerts(self.summary(now=now), now=now)
+            result = self.cleanup_burst(now=now)
+            if result["catch_up"]:
+                self._maintenance_delay = min(self.policy.interval_seconds, CLEANUP_CATCHUP_SECONDS)
+            if monitor:
+                self.evaluate_alerts(self.summary(now=now), now=now)
         finally:
             with self.store._db(True) as db:
                 db.execute(
                     "UPDATE operation_leases SET expires_at=? WHERE name='maintenance' AND token=?",
-                    (now + self.policy.interval_seconds, token),
+                    (now + max(0, time.monotonic() - started) + self._maintenance_delay, token),
                 )
         return True
 
@@ -664,7 +868,7 @@ class Operations:
                 )
                 worked = False
             self._stopping.wait(
-                0.1 if notify and worked else (1 if notify else self.policy.interval_seconds)
+                0.1 if notify and worked else (1 if notify else self._maintenance_delay)
             )
 
     def start(self):

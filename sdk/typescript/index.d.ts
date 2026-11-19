@@ -14,7 +14,14 @@ export class RelayError extends Error {
   idempotencyKey: string;
   status: number | undefined;
   retryable: boolean;
-  constructor(message: string, options: { idempotencyKey: string; status?: number; retryable?: boolean });
+  cause: unknown;
+  constructor(message: string, options: { idempotencyKey: string; status?: number; retryable?: boolean; cause?: unknown });
+}
+/** Previously accepted by Relay; this does not establish successful delivery. */
+export class RelayEventExpired extends RelayError {
+  accepted: true;
+  eventId: string;
+  constructor(options: { idempotencyKey: string; eventId: string });
 }
 export class RelayClient {
   constructor(options: { baseUrl: string; apiKey: string; timeoutMs?: number; maxRetries?: number });

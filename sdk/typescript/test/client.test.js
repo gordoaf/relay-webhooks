@@ -3,7 +3,7 @@ import { createHmac } from 'node:crypto';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import test from 'node:test';
-import { RelayClient, RelayError, verifySignature } from '../index.js';
+import { RelayClient, RelayError, RelayEventExpired, verifySignature } from '../index.js';
 
 async function server(handler, run) {
   const instance = createServer(async (request, response) => {
@@ -43,6 +43,59 @@ test('a conflicting key is never retried or replaced', async () => {
       !error.retryable && error.idempotencyKey === 'persistent-key');
   });
   assert.equal(calls, 1);
+});
+
+test('expired acceptance retains the original event ID without claiming delivery', async () => {
+  let calls = 0;
+  await server((_, response) => {
+    calls++;
+    response.writeHead(410);
+    response.end('{"event_id":"evt_original","detail":"Previously accepted"}');
+  }, async (baseUrl) => {
+    await assert.rejects(new RelayClient({ baseUrl, apiKey: 'project_key' }).emit(
+      'order.created', {}, { idempotencyKey: 'original_key' },
+    ), (error) => error instanceof RelayEventExpired && error.eventId === 'evt_original' &&
+      error.accepted === true && error.status === 410 && !error.retryable &&
+      error.idempotencyKey === 'original_key' && error.message.includes('do not resubmit'));
+  });
+  assert.equal(calls, 1);
+});
+
+test('malformed expired receipt preserves the key without inventing an event ID', async () => {
+  await server((_, response) => {
+    response.writeHead(410);
+    response.end('{"event_id":null}');
+  }, async (baseUrl) => {
+    await assert.rejects(new RelayClient({ baseUrl, apiKey: 'project_key' }).emit(
+      'order.created', {}, { idempotencyKey: 'original_key' },
+    ), (error) => error instanceof RelayError && !(error instanceof RelayEventExpired) &&
+      !error.retryable && error.message.includes('retain the original'));
+  });
+});
+
+test('TLS certificate failures are not retried and retain their cause', async (context) => {
+  const original = new TypeError('fetch failed', {
+    cause: Object.assign(new Error('certificate expired'), { code: 'CERT_HAS_EXPIRED' }),
+  });
+  let calls = 0;
+  context.mock.method(globalThis, 'fetch', async () => { calls++; throw original; });
+  await assert.rejects(new RelayClient({ baseUrl: 'https://relay.example', apiKey: 'project_key' }).emit(
+    'order.created', {}, { idempotencyKey: 'key' },
+  ), (error) => !error.retryable && error.cause === original &&
+    error.message.includes('certificate verification failed'));
+  assert.equal(calls, 1);
+});
+
+test('transient transport failures retain their cause and retry ambiguity', async (context) => {
+  const original = new TypeError('fetch failed', {
+    cause: Object.assign(new Error('connection reset'), { code: 'ECONNRESET' }),
+  });
+  let calls = 0;
+  context.mock.method(globalThis, 'fetch', async () => { calls++; throw original; });
+  await assert.rejects(new RelayClient({ baseUrl: 'https://relay.example', apiKey: 'project_key', maxRetries: 1 }).emit(
+    'order.created', {}, { idempotencyKey: 'key' },
+  ), (error) => error.retryable && error.cause === original);
+  assert.equal(calls, 2);
 });
 
 test('transient HTTP errors retry the same logical event', async () => {
@@ -107,4 +160,7 @@ test('verify exact raw bytes, timestamps, and multiple rotation signatures', () 
   assert.equal(verifySignature(secret, body, headers, { now: 699 }), false);
   assert.equal(verifySignature(secret, body, headers, { now: NaN }), false);
   assert.equal(verifySignature(secret, body, { ...headers, 'Webhook-Signature': 'v1,!' }, { now: 1000 }), false);
+  assert.equal(verifySignature(secret, body, headers, null), false);
+  assert.equal(verifySignature(secret, body, null), false);
+  assert.equal(verifySignature(secret, body, headers, []), false);
 });

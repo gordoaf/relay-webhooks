@@ -83,6 +83,10 @@ stable `<order_id>:<event_type>` idempotency key, including after a crash betwee
 Relay accepting an event and the storefront saving the receipt. Transient
 acceptance failures retry with bounded backoff; permanent 4xx errors are shown
 as needing operator attention instead of repeatedly creating new events.
+If retention has removed an already accepted event, Relay returns its original
+ID with HTTP 410. The storefront saves that acceptance and displays
+**Accepted · details expired**; it does not fabricate a warehouse fulfillment or
+accounting record, and never replaces the idempotency key.
 
 This is an integration example, not a production commerce system: it has no
 payment processor, inventory reservation, accounts, or public checkout
@@ -100,10 +104,27 @@ configuration. To run a fresh exercise, choose a new storefront database and
 Relay database. If setup fails partway through, an incomplete project may remain
 in Relay; inspect it in the console before trying again.
 
-If you rotate a project key or signing secret in Relay, update the corresponding
-value in the example's local configuration before its overlap expires. The
-sample deliberately does not store an administrator token or manage rotations
-on your behalf. A new isolated setup is simpler for repeat demonstrations.
+If you rotate a project key or signing secret in Relay, update the example's
+local credentials before the overlap expires. Set `RELAY_PROJECT_KEY` and/or
+`RELAY_WAREHOUSE_SIGNING_SECRET` / `RELAY_ACCOUNTING_SIGNING_SECRET` to the new
+values in a terminal, then run:
+
+```sh
+python examples/storefront/app.py credentials --resume-blocked
+```
+
+The command validates and saves credentials without printing them. The running
+sender and receivers load the new values without a restart. `--resume-blocked`
+also makes blocked outbox records eligible to retry, retaining every original
+event payload and idempotency key. Remove the environment variables afterward.
+Use `--db` if your storefront has a different database path. The example never
+stores an administrator token or performs the rotation itself.
+
+After fixing other configuration errors, click **Retry blocked submissions** in
+the dashboard or run `python examples/storefront/app.py resume`. A 409 payload
+conflict still needs investigation and will block again if unresolved; recovery
+does not rewrite the conflicting payload, replace its key, or create a new order.
+Only pending blocked submissions are resumed, never already accepted events.
 
 Run the regression tests from the repository root with:
 

@@ -8,7 +8,9 @@
 | `RELAY_DB_PATH` | `data/relay.db` | Local SQLite database |
 | `RELAY_PUBLIC_URL` | Unset | Canonical browser-facing HTTP(S) origin, such as `https://relay.example.com` |
 | `RELAY_ALLOW_PRIVATE_NETWORKS` | `false` | Permit private destination addresses only in a controlled environment |
-| `RELAY_WORKER_ENABLED` | `true` | Run four worker threads with the API |
+| `RELAY_WORKER_ENABLED` | `true` | Run delivery workers with the API |
+| `RELAY_WORKER_CONCURRENCY` | `4` | Delivery threads per API/worker process, 1-64 |
+| `RELAY_METRICS_TOKEN` | Unset | Optional separate random token of at least 24 characters, accepted only for Prometheus scraping |
 
 Normal operation is `relay serve --host 127.0.0.1 --port 8787`. The process exits if its administrator token is missing or too short. The CLI reads environment variables; it does not load `.env` files itself. Docker Compose loads `.env` for interpolation.
 
@@ -56,9 +58,9 @@ On POSIX systems, Relay creates its data directory with mode 0700 and restricts 
 
 Set `RELAY_WORKER_ENABLED=false` for the API and run `relay worker` with the same database path, administrator configuration, and destination policy. Multiple processes on the same host can claim work safely. All must use a local filesystem and the same configuration. This is not a multi-host database setup.
 
-The scheduler allows one active delivery per endpoint and two per project by default, counted from unexpired leases across processes. It alternates eligible projects and endpoints. Three consecutive attempt timeouts pause new work for that endpoint for 30 seconds; further timeouts renew that cooldown until a non-timeout result resets it. Rate limits still apply. These limits protect other projects during an outage and can reduce peak throughput to a single receiver.
+The scheduler allows one active delivery per endpoint and two per project by default, counted from unexpired leases across processes. It alternates eligible projects and endpoints. After the first timeout, that endpoint's next claims share a single instance-wide probe allowance with other timing-out endpoints. With multiple worker threads, known failing destinations cannot occupy every delivery slot. Initially unknown failures can still occupy slots until their first timeout; a single worker cannot reserve separate healthy capacity. Three consecutive timeouts start a 30-second cooldown, then 60, 120, 240, 480, and at most 600 seconds on further timeouts. A non-timeout result resets the streak. Endpoint rate limits still apply.
 
-DNS lookups for the same hostname are coalesced and failures have a short bounded cache. Outstanding operating-system lookups remain bounded even after a caller times out. Multiple distinct stalled hostnames can still consume resolver capacity; use a reliable local resolver and outbound network controls for sustained workloads.
+DNS lookups for the same hostname are coalesced and failures have a short bounded cache. Each process allows eight outstanding operating-system lookups, with at most two owned by one delivery project and six owned by delivery work altogether. The remaining capacity is available to endpoint validation and operator notifications. Caller timeouts do not release slots until the underlying OS lookup finishes. Local capacity shortages defer deliveries with jitter without recording a failed attempt, consuming retry budget, or extending endpoint cooldowns. The actual destination's DNS timeout still counts as a failed attempt. Distinct stalled names across projects can exhaust delivery capacity; use a reliable local resolver and monitor capacity deferrals. These per-process bounds are not a host-wide DNS quota.
 
 ## Backups and retention
 
@@ -75,6 +77,8 @@ with sqlite3.connect("data/relay.db") as source:
 Backups include event data, receiver response excerpts, and signing secrets. Store them with restricted permissions. Restore into an isolated instance first; pending or expired processing rows can resume delivery when workers start.
 
 Automatic retention is disabled by default. Set `RELAY_RETENTION_DAYS=30` to retain completed history for 30 days. An event becomes eligible only after its entire fanout is terminal and all of its deliveries have remained unchanged past the cutoff. Queued recovery members are protected. Cleanup removes bounded batches of attempts, deliveries, and then events; large histories may need several passes.
+
+Automatic cleanup runs up to 50 batches or a 200 ms soft budget per burst, releasing the writer lock and yielding between batches. Remaining work schedules another burst after one second. A complete scan with no deletion progress returns to the ordinary maintenance interval. The budget is checked between batches: a database busy wait or one batch may take longer. Monitoring keeps its separate normal interval. Manual cleanup and previews still operate on one batch. Measure sustained cleanup against your workload; the age setting does not guarantee immediate deletion of every eligible record.
 
 The service preserves a hashed idempotency-key tombstone for `RELAY_IDEMPOTENCY_DAYS` (default 90) after an event is purged. During that window an identical submission returns HTTP 410 with the original event ID, and conflicting content returns 409. After expiry the key can create a new event. Unfinished events retain their original idempotency records regardless of age.
 
@@ -100,13 +104,13 @@ Application logs omit payloads and secrets. The console can show response excerp
 
 ## Upgrade
 
-For 0.2.0, back up the database and stop **all API and worker processes** before upgrading. The next startup atomically migrates schema 1 or 2 to schema 3, preserving projects, endpoints, events, and attempt history. It adds subscriptions, credential overlap, recovery jobs, retention and monitoring state. Existing 0.1.1 sessions remain valid. Destination URLs in old attempt records stay unknown; new attempts record the claimed URL. Existing 0.1.0 browser cookies require a new login. Processes refuse newer unknown schema versions; do not run mixed application versions against the same database. To roll back, stop all processes and restore the pre-upgrade backup with the old application version.
+For 0.2.1, back up the database and stop **all API and worker processes** before upgrading. The next startup atomically migrates schema 1, 2, or 3 to schema 4, preserving projects, endpoints, events, and attempt history. The new migration adds shared failure-probe accounting, DNS deferral counters, and notification throttling state. Existing 0.1.1/0.2.0 sessions remain valid. Destination URLs in pre-0.2 attempt records stay unknown; new attempts record the claimed URL. Existing 0.1.0 browser cookies require a new login. Processes refuse newer unknown schema versions; do not run mixed application versions against the same database. To roll back, stop all processes and restore the pre-upgrade backup with the old application version. Retention remains opt-in. Existing accepted events keep their idempotency semantics; the new serialized-size limit applies to new acceptance and does not rewrite historical payloads.
 
 ## Monitoring and alert delivery
 
-The console's Health & storage page and `relay status` expose queue depth/age, failures and mean attempt latency over the last hour, cooldown counts, disk usage, and alerts. `/metrics` exposes Prometheus gauges and requires administrator authentication. Keep it behind your monitoring network/access gateway; supply the admin token through your collector's secret mechanism.
+The console's Health & storage page and `relay status` expose queue depth/age, failures and mean attempt latency over the last hour, cooldown counts, disk usage, and alerts. `/metrics` exposes Prometheus gauges and persistent DNS-capacity deferral counters. Set a separate random `RELAY_METRICS_TOKEN` for your collector; it must differ from the administrator token and permits only GET/HEAD requests to `/metrics`. Supply it as a Bearer token through the collector's secret mechanism. Administrator authentication remains supported. Keep the route behind your monitoring network/access gateway. Rotate the metrics token by updating the environment and restarting each API process; it grants no console, event-ingestion, or administrative API access.
 
-Alerts cover old unfinished work at enabled destinations, excessive recent failures, timeout cooldowns, and storage pressure. Paused endpoints contribute to queue age but do not trigger the delay alert. Alerts are persisted and visible without an outbound receiver. To receive notifications, configure both `RELAY_ALERT_WEBHOOK_URL` and `RELAY_ALERT_SIGNING_SECRET`. Generate a secret with:
+Alerts cover old unfinished work at enabled destinations, excessive recent failures, timeout cooldowns, storage pressure, and recent DNS-capacity deferrals. The `resolver_capacity` alert uses instance-wide resource pressure; local deferrals do not inflate the failed-attempt rate. Scrape `relay_delivery_deferrals_total` and `relay_delivery_last_deferral_timestamp_seconds` to track the two fixed reasons (`dns_global_capacity` and `dns_project_capacity`). Paused endpoints contribute to queue age but do not trigger the delay alert. Alerts are persisted and visible without an outbound receiver. To receive notifications, configure both `RELAY_ALERT_WEBHOOK_URL` and `RELAY_ALERT_SIGNING_SECRET`. Generate a secret with:
 
 ```sh
 python -c "import base64,secrets; print('whsec_' + base64.b64encode(secrets.token_bytes(32)).decode())"
@@ -114,7 +118,7 @@ python -c "import base64,secrets; print('whsec_' + base64.b64encode(secrets.toke
 
 The receiver gets a signed Standard Webhooks envelope of type `relay.alert.active` or `relay.alert.resolved`, containing an alert code, severity, message, and timestamps. Verify the raw body and deduplicate by webhook ID. The URL is used directly; services requiring proprietary message formats need an adapter. Neither event payloads nor credentials appear in alerts. Protect the receiver URL if it embeds an access token.
 
-Notifications use separate threads from event delivery, shared database leases, a five-second network deadline, at most three attempts per notification cycle, and cooldown reminders for active alerts. Network checks and redirect rejection match ordinary deliveries. They still share the host, database, and bounded resolver: use external monitoring for host failure, service downtime, or scrape failures. `/healthz` remains a basic process/database probe and does not promise queue freshness.
+Notifications use separate threads from event delivery, shared database leases, a five-second network deadline, and at most three attempts per notification cycle. The cooldown now spans active/resolved transitions for each alert code: the dashboard updates immediately, while pending notifications coalesce to the latest state until the gate opens. This limits flapping but can delay recovery notices by the configured cooldown. Retries of the same notification keep their bounded 30/60-second backoff; continuing active alerts receive cooldown reminders. Network checks and redirect rejection match ordinary deliveries. Notifications have access to reserved resolver capacity but still share the host and database: use external monitoring for host failure, service downtime, or scrape failures. `/healthz` remains a basic process/database probe and does not promise queue freshness.
 
 ## Maintenance configuration
 
@@ -123,7 +127,7 @@ Notifications use separate threads from event delivery, shared database leases, 
 | `RELAY_RETENTION_DAYS` | `0` | Completed history age; 0 disables deletion |
 | `RELAY_IDEMPOTENCY_DAYS` | `90` | Key protection after payload deletion; at least 1 day |
 | `RELAY_CLEANUP_BATCH_SIZE` | `100` | Per-table deletion bound per pass; 1-1000 |
-| `RELAY_MAINTENANCE_INTERVAL_SECONDS` | `30` | Maintenance polling interval |
+| `RELAY_MAINTENANCE_INTERVAL_SECONDS` | `30` | Monitoring and ordinary cleanup interval; outstanding cleanup uses shorter catch-up passes |
 | `RELAY_MAINTENANCE_ENABLED` | `true` | Run maintenance and notification threads in API/worker processes |
 | `RELAY_MIN_FREE_BYTES` | `0` | Optional disk-space reserve for accepting new events |
 | `RELAY_MAX_STORAGE_BYTES` | `0` | Optional estimated used SQLite/WAL capacity ceiling |
@@ -133,7 +137,7 @@ Notifications use separate threads from event delivery, shared database leases, 
 | `RELAY_FAILURE_MIN_SAMPLES` | `10` | Minimum recent attempts before failure-rate alerts |
 | `RELAY_ALERT_WEBHOOK_URL` | Unset | Optional operator notification destination |
 | `RELAY_ALERT_SIGNING_SECRET` | Unset | Paired `whsec_` secret for the notification receiver |
-| `RELAY_ALERT_COOLDOWN_SECONDS` | `3600` | Reminder interval for continuing active alerts |
+| `RELAY_ALERT_COOLDOWN_SECONDS` | `3600` | Per-code notification-cycle gate across transitions and active reminders |
 
 Capacity checks are conservative admission estimates, not filesystem quotas: attempt logs, administrative writes, and WAL behavior can still grow storage. A rejected event receives 503 before commit; existing idempotency reads remain available. Monitor free space externally as well. In Compose, these environment variables are forwarded from `.env`.
 

@@ -1,6 +1,6 @@
 # API
 
-The service defaults to `http://127.0.0.1:8787`. JSON request bodies are limited to 256 KiB, including chunked requests. Authenticated OpenAPI output is available at `GET /api/openapi.json`.
+The service defaults to `http://127.0.0.1:8787`. JSON request bodies are limited to 256 KiB, including chunked requests. New events must also fit within 256 KiB after normalization and serialization of the complete delivery envelope (`id`, `type`, `created_at`, `data`). Either size violation returns HTTP 413 before acceptance. Compact number notation can expand during normalization; leave room for envelope fields. Previously accepted idempotency keys retain their original semantics. Authenticated OpenAPI output is available at `GET /api/openapi.json`.
 
 ## Authentication
 
@@ -8,6 +8,7 @@ The service defaults to `http://127.0.0.1:8787`. JSON request bodies are limited
 - The console exchanges the administrator token at `POST /api/session` for a signed, eight-hour HttpOnly SameSite=Strict cookie backed by a hashed database session record. Cookies use Secure when `RELAY_PUBLIC_URL` is HTTPS, or when the request scheme is HTTPS if that setting is absent. Logout revokes the session across processes, including copied cookies; changing the administrator token also invalidates existing signatures.
 - Cookie-authenticated mutations require a matching Origin or `X-Relay-Request: 1`. A mismatched Origin is rejected even with that header.
 - Event ingestion accepts a project API key, which cannot access administrative endpoints.
+- An optional `RELAY_METRICS_TOKEN` permits only `GET` and `HEAD /metrics`. It cannot log in, submit events, or access administrative APIs.
 - Repeated failed administrator authentication receives HTTP 429 with `Retry-After`. Successful logins do not consume the failure allowance, and valid administrator credentials remain usable after other failed attempts. Credentials are checked before that response, so it does not cap comparisons or prevent guessing on its own. Enforce the hard request ceiling at the ingress proxy and generate an unpredictable administrator token.
 
 ## Event ingestion
@@ -62,6 +63,8 @@ Endpoint creation accepts `"subscriptions":["order.created","invoice.*"]`. Omitt
 
 Endpoint PATCH accepts one or more non-null editable fields. URL changes undergo the same public-address validation as creation and are checked again on delivery. Each future claim uses the current URL; in-flight claims retain their original destination. Attempt details include `endpoint_url`; null identifies legacy history whose destination cannot be established.
 
+If Relay's local DNS capacity is temporarily full, endpoint creation or URL validation returns HTTP 503 with `Retry-After`. The endpoint change has not been committed; retry the same request later.
+
 `POST /api/projects/{project}/endpoints/{endpoint}/rotate-secret`
 
 ```json
@@ -81,13 +84,13 @@ Job statuses are `running`, `completed`, and `cancelled`. Completion describes r
 
 ## Monitoring and storage
 
-All of these routes require administrator authentication:
+These routes require administrator authentication, except `/metrics`, which also accepts the optional dedicated monitoring token:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/api/operations` | Instance queue, recent attempt outcomes, endpoint cooldowns, storage, policy, and alerts |
 | GET | `/api/projects/{project}/metrics` | Project queue/outcomes/endpoints plus instance storage/policy/alerts |
-| GET | `/metrics` | Prometheus text format, fixed low-cardinality labels |
+| GET / HEAD | `/metrics` | Prometheus text format, fixed low-cardinality labels; admin or metrics token |
 | POST | `/api/maintenance/cleanup` | `{"dry_run":true}` previews; false applies one bounded batch |
 
 Attempt metrics use the last hour; queue counts describe current retained state. Cleanup policy is supplied through server configuration, not the request. The response reports eligible events in the next bounded scan (not the entire history), `scanned_events`, `scan_limit`, deleted event/delivery/attempt counts, and `has_more`. Because cleanup is incremental and automatic maintenance may run concurrently, a preview is informative rather than a reserved deletion plan.

@@ -12,6 +12,8 @@ import secrets
 import sqlite3
 import time
 
+from .events import PayloadTooLarge, serialize_event
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, api_key_hash TEXT NOT NULL UNIQUE, created_at REAL NOT NULL
@@ -49,7 +51,15 @@ CREATE INDEX IF NOT EXISTS deliveries_event ON deliveries(event_id);
 CREATE INDEX IF NOT EXISTS endpoints_project ON endpoints(project_id);
 CREATE INDEX IF NOT EXISTS attempts_delivery ON attempts(delivery_id,attempt_number);
 """
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+AVAILABILITY_SCHEMA = """
+CREATE INDEX IF NOT EXISTS deliveries_processing_probes ON deliveries(lease_expires_at)
+ WHERE status='processing' AND lease_is_probe=1;
+CREATE TABLE IF NOT EXISTS delivery_deferrals (
+ reason TEXT PRIMARY KEY CHECK(reason IN ('dns_global_capacity','dns_project_capacity')),
+ count INTEGER NOT NULL, last_seen_at REAL NOT NULL
+);
+"""
 LIFECYCLE_SCHEMA = """
 CREATE INDEX IF NOT EXISTS deliveries_failed_project
  ON deliveries(project_id,updated_at,id) WHERE status='failed';
@@ -199,10 +209,11 @@ def _overlap(value):
 class Store:
     """File-backed SQLite queue. Mutations take a short exclusive writer reservation."""
 
-    def __init__(self, path):
+    def __init__(self, path, max_delivery_bytes=262144):
         if str(path) == ":memory:":
             raise ValueError("Use a file-backed database so deliveries survive process restarts")
         self.path = str(Path(path).expanduser().resolve())
+        self.max_delivery_bytes = max_delivery_bytes
         self.capacity_guard = None
         self._next_recovery_cleanup = 0
 
@@ -304,6 +315,15 @@ class Store:
                     "UPDATE deliveries SET cycle_started_at=created_at WHERE cycle_started_at IS NULL"
                 )
             for statement in LIFECYCLE_SCHEMA.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            if version < 4:
+                existing = {row["name"] for row in db.execute("PRAGMA table_info(deliveries)")}
+                if "lease_is_probe" not in existing:
+                    db.execute(
+                        "ALTER TABLE deliveries ADD COLUMN lease_is_probe INTEGER NOT NULL DEFAULT 0"
+                    )
+            for statement in AVAILABILITY_SCHEMA.split(";"):
                 if statement.strip():
                     db.execute(statement)
             from .operations import initialize_operations
@@ -541,6 +561,10 @@ class Store:
             from .operations import check_tombstone
 
             check_tombstone(db, project_id, idempotency_key, event_type, raw, now=now)
+            if len(serialize_event(event_id, event_type, now, payload)) > self.max_delivery_bytes:
+                raise PayloadTooLarge(
+                    "Serialized delivery body is too large; event was not accepted"
+                )
             endpoints = [
                 ep
                 for ep in db.execute(
@@ -645,7 +669,15 @@ class Store:
         return result
 
     @staticmethod
-    def _next_delivery(db, now, endpoint_concurrency, project_concurrency):
+    def _next_delivery(db, now, endpoint_concurrency, project_concurrency, max_failing_probes):
+        probe_available = (
+            db.execute(
+                """SELECT COUNT(*) FROM deliveries INDEXED BY deliveries_processing_probes
+            WHERE status='processing' AND lease_is_probe=1 AND lease_expires_at>?""",
+                (now,),
+            ).fetchone()[0]
+            < max_failing_probes
+        )
         projects = db.execute(
             """SELECT p.id FROM projects p WHERE
             (SELECT COUNT(*) FROM deliveries d INDEXED BY deliveries_processing_project
@@ -657,11 +689,11 @@ class Store:
             endpoints = db.execute(
                 """SELECT ep.* FROM endpoints ep
                 WHERE ep.project_id=? AND ep.enabled=1 AND ep.next_available_at<=?
-                  AND ep.cooldown_until<=? AND
+                  AND ep.cooldown_until<=? AND (ep.consecutive_timeouts=0 OR ?) AND
                 (SELECT COUNT(*) FROM deliveries d INDEXED BY deliveries_processing_endpoint
                  WHERE d.endpoint_id=ep.id AND d.status='processing' AND d.lease_expires_at>?)<?
                 ORDER BY ep.last_claimed_at,ep.created_at,ep.id""",
-                (project["id"], now, now, now, endpoint_concurrency),
+                (project["id"], now, now, probe_available, now, endpoint_concurrency),
             )
             for endpoint in endpoints:
                 # Each lookup reads at most one indexed candidate. Disabled/rate-limited
@@ -699,28 +731,47 @@ class Store:
                             else None
                         ),
                         "rate_limit": endpoint["rate_limit"],
+                        "lease_is_probe": int(endpoint["consecutive_timeouts"] > 0),
                     }
         return None
 
-    def claim_delivery(self, lease_seconds=30, *, endpoint_concurrency=1, project_concurrency=2):
+    def claim_delivery(
+        self,
+        lease_seconds=30,
+        *,
+        endpoint_concurrency=1,
+        project_concurrency=2,
+        max_failing_probes=1,
+    ):
         if not math.isfinite(lease_seconds) or lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive and finite")
         for name, value in (
             ("endpoint_concurrency", endpoint_concurrency),
             ("project_concurrency", project_concurrency),
+            ("max_failing_probes", max_failing_probes),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
         with self._db(True) as db:
             now = time.time()
-            row = self._next_delivery(db, now, endpoint_concurrency, project_concurrency)
+            row = self._next_delivery(
+                db, now, endpoint_concurrency, project_concurrency, max_failing_probes
+            )
             if row is None:
                 return None
             token = secrets.token_urlsafe(24)
             db.execute(
                 """UPDATE deliveries SET status='processing',lease_token=?,lease_expires_at=?,
-                lease_started_at=?,lease_endpoint_url=?,updated_at=? WHERE id=?""",
-                (token, now + lease_seconds, now, row["endpoint_url"], now, row["id"]),
+                lease_started_at=?,lease_endpoint_url=?,lease_is_probe=?,updated_at=? WHERE id=?""",
+                (
+                    token,
+                    now + lease_seconds,
+                    now,
+                    row["endpoint_url"],
+                    row["lease_is_probe"],
+                    now,
+                    row["id"],
+                ),
             )
             db.execute(
                 "UPDATE endpoints SET next_available_at=?,last_claimed_at=? WHERE id=?",
@@ -794,7 +845,7 @@ class Store:
             db.execute(
                 """UPDATE deliveries SET status=?,attempt_count=?,cycle_attempts=?,next_attempt_at=?,last_status_code=?,last_error=?,last_duration_ms=?,
                           last_response_excerpt=?,updated_at=?,last_endpoint_url=lease_endpoint_url,
-                          lease_endpoint_url=NULL,lease_token=NULL,lease_expires_at=NULL,lease_started_at=NULL WHERE id=?""",
+                          lease_endpoint_url=NULL,lease_token=NULL,lease_expires_at=NULL,lease_started_at=NULL,lease_is_probe=0 WHERE id=?""",
                 (
                     status,
                     number,
@@ -809,11 +860,16 @@ class Store:
                 ),
             )
             if timed_out and status != "delivered":
+                previous = db.execute(
+                    "SELECT consecutive_timeouts FROM endpoints WHERE id=?", (row["endpoint_id"],)
+                ).fetchone()[0]
+                streak = min(previous + 1, 32)
+                cooldown = min(600, 30 * 2 ** min(streak - 3, 5)) if streak >= 3 else 0
                 db.execute(
                     """UPDATE endpoints SET
-                    cooldown_until=CASE WHEN consecutive_timeouts>=2 THEN ? ELSE cooldown_until END,
-                    consecutive_timeouts=MIN(consecutive_timeouts+1,3) WHERE id=?""",
-                    (now + 30, row["endpoint_id"]),
+                    cooldown_until=CASE WHEN ?>=3 THEN ? ELSE cooldown_until END,
+                    consecutive_timeouts=? WHERE id=?""",
+                    (streak, now + cooldown, streak, row["endpoint_id"]),
                 )
             else:
                 db.execute(
@@ -821,6 +877,42 @@ class Store:
                     (row["endpoint_id"],),
                 )
             return True
+
+    def defer_delivery(self, delivery_id, lease_token, *, reason, retry_after_seconds=1):
+        """Return an owned claim to the queue without blaming its destination."""
+        if reason not in {"dns_global_capacity", "dns_project_capacity"}:
+            raise ValueError("Unknown delivery deferral reason")
+        if (
+            isinstance(retry_after_seconds, bool)
+            or not isinstance(retry_after_seconds, (int, float))
+            or not math.isfinite(retry_after_seconds)
+            or not 0.1 <= retry_after_seconds <= 60
+        ):
+            raise ValueError("Deferral delay must be between 0.1 and 60 seconds")
+        with self._db(True) as db:
+            now = time.time()
+            changed = db.execute(
+                """UPDATE deliveries SET status=CASE WHEN cycle_attempts=0 THEN 'pending' ELSE 'retrying' END,
+                next_attempt_at=?,updated_at=?,lease_token=NULL,lease_expires_at=NULL,lease_started_at=NULL,
+                lease_endpoint_url=NULL,lease_is_probe=0
+                WHERE id=? AND status='processing' AND lease_token=? AND lease_expires_at>?""",
+                (now + retry_after_seconds, now, delivery_id, lease_token, now),
+            ).rowcount
+            if changed:
+                db.execute(
+                    """INSERT INTO delivery_deferrals(reason,count,last_seen_at) VALUES(?,1,?)
+                           ON CONFLICT(reason) DO UPDATE SET count=MIN(count+1,9223372036854775807),
+                           last_seen_at=excluded.last_seen_at""",
+                    (reason, now),
+                )
+            return bool(changed)
+
+    def deferral_stats(self):
+        with self._db() as db:
+            return {
+                row["reason"]: {"count": row["count"], "last_seen_at": row["last_seen_at"]}
+                for row in db.execute("SELECT * FROM delivery_deferrals")
+            }
 
     def replay_delivery(self, project_id, delivery_id):
         with self._db(True) as db:

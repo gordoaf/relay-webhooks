@@ -1,13 +1,51 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 export class RelayError extends Error {
-  constructor(message, { idempotencyKey, status, retryable = false }) {
-    super(message);
+  constructor(message, { idempotencyKey, status, retryable = false, cause }) {
+    super(message, { cause });
     this.name = "RelayError";
     this.idempotencyKey = idempotencyKey;
     this.status = status;
     this.retryable = retryable;
   }
+}
+
+export class RelayEventExpired extends RelayError {
+  constructor({ idempotencyKey, eventId }) {
+    super('Relay previously accepted this event, but its retained details expired; do not resubmit under a new idempotency key', {
+      idempotencyKey, status: 410,
+    });
+    this.name = 'RelayEventExpired';
+    this.eventId = eventId;
+    this.accepted = true;
+  }
+}
+
+const CERTIFICATE_ERRORS = new Set([
+  'CERT_HAS_EXPIRED', 'CERT_NOT_YET_VALID', 'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UNABLE_TO_GET_ISSUER_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'CERT_SIGNATURE_FAILURE', 'ERR_TLS_CERT_ALTNAME_INVALID', 'CERT_REVOKED',
+  'INVALID_CA', 'PATH_LENGTH_EXCEEDED',
+]);
+
+function certificateFailure(error) {
+  for (let depth = 0; error && depth < 8; depth++, error = error.cause) {
+    if (CERTIFICATE_ERRORS.has(error.code)) return true;
+  }
+  return false;
+}
+
+async function readReceipt(response) {
+  const chunks = [];
+  let size = 0;
+  if (!response.body) throw new Error('Empty receipt');
+  for await (const chunk of response.body) {
+    size += chunk.length;
+    if (size > 1024 * 1024) throw new Error('Receipt exceeds 1 MiB');
+    chunks.push(chunk);
+  }
+  return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
 }
 
 function validJSON(value, parents = new Set()) {
@@ -82,21 +120,24 @@ export class RelayClient {
         retryAfter = response.headers.get("retry-after");
         if (response.status === 200 || response.status === 202) {
           try {
-            const chunks = [];
-            let size = 0;
-            if (!response.body) throw new Error("Empty receipt");
-            for await (const chunk of response.body) {
-              size += chunk.length;
-              if (size > 1024 * 1024) throw new Error("Receipt exceeds 1 MiB");
-              chunks.push(chunk);
-            }
-            const receipt = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            const receipt = await readReceipt(response);
             if (!receipt || typeof receipt.created !== "boolean" ||
                 !receipt.event || typeof receipt.event.id !== "string") throw new Error("Invalid receipt");
             return receipt;
           } catch {
             error = new RelayError("Relay returned an invalid receipt; reuse the same idempotency key", {
               idempotencyKey, status: response.status, retryable: true,
+            });
+          }
+        } else if (response.status === 410) {
+          try {
+            const receipt = await readReceipt(response);
+            if (!receipt || typeof receipt.event_id !== 'string' ||
+                !/^[\x21-\x7e]{1,200}$/.test(receipt.event_id)) throw new Error('Invalid expired-event receipt');
+            error = new RelayEventExpired({ idempotencyKey, eventId: receipt.event_id });
+          } catch (cause) {
+            error = new RelayError('Relay returned an invalid expired-event receipt; retain the original idempotency key', {
+              idempotencyKey, status: 410, cause,
             });
           }
         } else {
@@ -106,9 +147,12 @@ export class RelayClient {
             retryable: [408, 429].includes(response.status) || (response.status >= 500 && response.status <= 599),
           });
         }
-      } catch {
-        error = new RelayError("Relay could not confirm acceptance; reuse the same idempotency key", {
-          idempotencyKey, retryable: true,
+      } catch (cause) {
+        const certificateError = certificateFailure(cause);
+        error = new RelayError(certificateError
+          ? 'Relay TLS certificate verification failed; check the certificate and hostname'
+          : 'Relay could not confirm acceptance; reuse the same idempotency key', {
+          idempotencyKey, retryable: !certificateError, cause,
         });
       }
       if (!error.retryable || attempt === this.maxRetries) throw error;
@@ -129,8 +173,10 @@ function decodeBase64(value) {
 }
 
 /** Verify the exact bytes received, before parsing JSON. Returns false on invalid input. */
-export function verifySignature(secret, rawBody, headers, { toleranceSeconds = 300, now = Date.now() / 1000 } = {}) {
+export function verifySignature(secret, rawBody, headers, options = {}) {
   try {
+    if (!options || typeof options !== 'object' || Array.isArray(options)) return false;
+    const { toleranceSeconds = 300, now = Date.now() / 1000 } = options;
     if (!(rawBody instanceof Uint8Array) || !Number.isFinite(toleranceSeconds) ||
         toleranceSeconds < 0 || !Number.isFinite(now)) return false;
     const values = headers instanceof Headers ? Object.fromEntries(headers) :

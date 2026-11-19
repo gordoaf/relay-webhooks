@@ -16,7 +16,7 @@ itself uses only the Python standard library and ships in the Relay package.
 
 ```python
 import os
-from relay.client import RelayClient, RelayError
+from relay.client import RelayClient, RelayError, RelayEventExpired
 
 relay = RelayClient(
     os.environ.get("RELAY_URL", "http://127.0.0.1:8787"),
@@ -36,14 +36,20 @@ silently creating a new event when an earlier request may already have committed
 The example storefront demonstrates an outbox that saves the order and its
 pending events in the same transaction.
 
-The Python client retries network errors, invalid success receipts, HTTP 408,
+The Python client retries transient network errors, invalid success receipts, HTTP 408,
 429, and 5xx twice by default. It preserves the serialized request and key.
-Other errors, including a 409 conflict, are returned immediately as `RelayError`:
+Certificate-verification failures are nonretryable and preserve a diagnostic cause;
+fix the certificate or trust configuration. Other errors, including a 409 conflict,
+are returned immediately as `RelayError`. HTTP 410 has a distinct subtype:
 
 ```python
 try:
     receipt = relay.emit("order.created", {"order_id": "order_1042", "total_cents": 3600},
                          idempotency_key="order_1042:created")
+except RelayEventExpired as exc:
+    # Relay accepted this event earlier, but its retained details have expired.
+    # Record acceptance with exc.event_id; this does not prove delivery success.
+    print("Previously accepted:", exc.event_id)
 except RelayError as exc:
     # exc.status is None when no HTTP receipt was available.
     # Retain exc.idempotency_key; an uncertain response can still mean committed.
@@ -115,3 +121,10 @@ the latter prevents repeated delivery from applying the same effect twice.
 Retention limits how long Relay remembers submitted keys. Configure retention
 to cover the maximum age of outbox retries and maintain longer business-level
 deduplication where necessary; the client does not extend the server's window.
+
+Both clients preserve expired acceptance as `RelayEventExpired`, with `event_id`
+in Python or `eventId` in JavaScript and `accepted` set to true. Keep the original
+key and event ID; do not turn this response into a new submission with another key.
+The storefront records this acceptance separately from receiver fulfillment.
+Its recovery controls let you update credentials and explicitly resume blocked
+outbox entries while preserving their original keys; see the walkthrough.

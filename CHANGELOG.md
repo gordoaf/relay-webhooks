@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 - 2026-11-19
+
+- Defer deliveries during local DNS capacity shortages without consuming retry attempts or penalizing destinations. Limit resolver ownership per project and reserve capacity for operator requests; expose persistent deferral counters.
+- Share a bounded probe allowance for timing-out endpoints across workers, increase repeated timeout cooldowns up to ten minutes, and expose worker concurrency through configuration.
+- Catch up retention with bounded multi-batch bursts and short follow-up intervals. Preserve short writer transactions, unfinished-event protection, and independent monitoring cadence.
+- Coalesce flapping alert transitions behind a persisted per-code notification gate. Add a separate read-only Prometheus token.
+- Check the complete normalized delivery envelope before accepting events, preventing compact JSON inputs from expanding beyond receiver limits.
+- Preserve previously accepted event IDs on HTTP 410 in both clients and the storefront. Add explicit blocked-outbox recovery, live credential refresh, certificate-error diagnostics, and Python origin-validation fixes.
+- Bound example receiver concurrency and deadlines before header parsing, use independent SQLite connections, and handle null JavaScript verification options safely.
+- Add regression coverage and migrate schema 1/2/3 to 4. Back up and stop all old API/worker processes before upgrading; see the operations guide.
+
 ## 0.2.0 - 2026-11-19
 
 - Route new events through endpoint subscriptions, with exact types, namespace wildcards, and immutable accepted fanout.

@@ -1,6 +1,8 @@
 import base64
+import http.client
 import json
 import socket
+import ssl
 import threading
 import time
 from contextlib import contextmanager
@@ -8,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from relay.client import RelayClient, RelayError, verify_signature
+from relay.client import RelayClient, RelayError, RelayEventExpired, verify_signature
 from relay.delivery import sign_headers
 
 
@@ -124,6 +126,87 @@ def test_client_invalid_success_receipt_is_ambiguous(monkeypatch):
     assert caught.value.retryable
     assert caught.value.status == 202
     assert caught.value.idempotency_key == "stable"
+
+
+def test_client_retains_expired_acceptance_id_without_retry():
+    calls = []
+
+    def expired(handler, body):
+        calls.append(handler.headers["Idempotency-Key"])
+        data = b'{"event_id":"evt_original","detail":"Previously accepted"}'
+        handler.send_response(410)
+        handler.send_header("Content-Length", str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
+
+    with receiver(expired) as url, pytest.raises(RelayEventExpired) as caught:
+        RelayClient(url, "project_key").emit("order.created", {}, idempotency_key="stable")
+    error = caught.value
+    assert error.accepted and error.event_id == "evt_original"
+    assert error.status == 410 and not error.retryable
+    assert error.idempotency_key == "stable" and calls == ["stable"]
+    assert "do not resubmit" in str(error)
+    assert "delivered" not in str(error)
+
+
+@pytest.mark.parametrize("body", [b"{}", b'{"event_id":null}', b'{"event_id":""}', b"not-json"])
+def test_client_malformed_expired_receipt_does_not_invent_acceptance(body, monkeypatch):
+    client = RelayClient("http://localhost", "project_key")
+    monkeypatch.setattr(client, "_request", lambda *_: (410, body, None))
+    with pytest.raises(RelayError) as caught:
+        client.emit("order.created", {}, idempotency_key="stable")
+    assert not isinstance(caught.value, RelayEventExpired)
+    assert "retain the original" in str(caught.value)
+    assert not caught.value.retryable
+
+
+def test_client_certificate_failure_is_not_retried_and_preserves_cause(monkeypatch):
+    client = RelayClient("https://relay.example", "project_key")
+    original = ssl.SSLCertVerificationError(1, "certificate verify failed")
+    calls = []
+
+    def fail(*_):
+        calls.append(1)
+        raise original
+
+    monkeypatch.setattr(client, "_request", fail)
+    with pytest.raises(RelayError) as caught:
+        client.emit("order.created", {}, idempotency_key="stable")
+    assert calls == [1]
+    assert not caught.value.retryable
+    assert caught.value.cause is original and caught.value.__cause__ is original
+    assert "certificate verification failed" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "url,host,port",
+    [
+        ("http://[::1]", "::1", 80),
+        ("https://[2001:db8::2]", "2001:db8::2", 443),
+        ("http://[::1]:8787", "::1", 8787),
+        ("https://münich.example", "xn--mnich-kva.example", 443),
+    ],
+)
+def test_client_normalizes_hostname_and_default_ports(url, host, port):
+    client = RelayClient(url, "project_key")
+    connection = http.client.HTTPConnection(client._host, client._port)
+    assert (connection.host, connection.port) == (host, port)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://" + "a" * 64 + ".example",
+        "http://bad\ud800.example",
+        "http://bad_host.example",
+        "http://example.com:0",
+        "http://example.com:65536",
+        "http://good.example\n.evil.example",
+    ],
+)
+def test_client_invalid_hostname_fails_at_configuration(url):
+    with pytest.raises(ValueError):
+        RelayClient(url, "project_key")
 
 
 @pytest.mark.parametrize(

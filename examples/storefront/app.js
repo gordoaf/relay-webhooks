@@ -49,12 +49,15 @@ async function refresh() {
       cell(row, order.id);
       cell(row, order.customer);
       cell(row, new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(order.total_cents / 100));
-      cell(row, order.pending_events ? `${order.pending_events} pending` : 'Both accepted', order.pending_events ? 'pending' : 'online');
+      cell(row, order.pending_events ? `${order.pending_events} pending` :
+        order.expired_events ? 'Accepted · details expired' : 'Both accepted', order.pending_events ? 'pending' : 'online');
       cell(row, order.warehouse ? 'Fulfilled' : 'Waiting', order.warehouse ? 'online' : 'pending');
       cell(row, order.accounting ? 'Recorded' : 'Waiting', order.accounting ? 'online' : 'pending');
       return row;
     }));
     byId('outbox-panel').hidden = state.outbox.length === 0;
+    byId('resume-outbox').hidden = !state.blocked_count;
+    byId('resume-outbox').textContent = `Retry ${state.blocked_count} blocked submissions`;
     byId('outbox').replaceChildren(...state.outbox.map((entry) => {
       const li = document.createElement('li');
       li.textContent = `${entry.order_id} · ${entry.event_type} · ${entry.blocked ? 'Needs operator attention' : 'Retrying'}${entry.last_error ? `: ${entry.last_error}` : ''}`;
@@ -83,6 +86,16 @@ byId('checkout').addEventListener('submit', async (event) => {
     await refresh();
   } catch (error) { notice(error.message, true); }
   finally { byId('place-order').disabled = false; }
+});
+
+byId('resume-outbox').addEventListener('click', async () => {
+  byId('resume-outbox').disabled = true;
+  try {
+    const result = await request('/api/outbox/resume', {});
+    notice(`Resumed ${result.resumed} submissions with their original idempotency keys.`);
+    await refresh();
+  } catch (error) { notice(error.message, true); }
+  finally { byId('resume-outbox').disabled = false; }
 });
 
 for (const service of ['warehouse', 'accounting']) {

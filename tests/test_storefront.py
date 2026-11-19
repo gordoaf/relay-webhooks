@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from relay.client import RelayError
+from relay.client import RelayError, RelayEventExpired
 from relay.delivery import sign_headers
 
 spec = importlib.util.spec_from_file_location(
@@ -96,6 +96,128 @@ def test_permanent_ingress_error_blocks_outbox_without_new_key(storefront):
 
     storefront.send_pending(Conflict(), now=1000)
     assert all(entry["blocked"] for entry in storefront.state()["outbox"])
+
+
+def test_expired_acceptance_completes_outbox_without_claiming_delivery(storefront):
+    storefront.order("Already accepted", 1)
+
+    class Expired:
+        def emit(self, event_type, payload, *, idempotency_key):
+            raise RelayEventExpired(idempotency_key=idempotency_key, event_id="evt_" + event_type)
+
+    storefront.send_pending(Expired())
+    state = storefront.state()
+    assert state["outbox"] == [] and state["blocked_count"] == 0
+    assert state["orders"][0]["expired_events"] == 2
+    assert state["orders"][0]["pending_events"] == 0
+    assert not state["orders"][0]["warehouse"] and not state["orders"][0]["accounting"]
+    with storefront.db() as db:
+        assert {row[0] for row in db.execute("SELECT event_id FROM outbox")} == {
+            "evt_order.created",
+            "evt_invoice.paid",
+        }
+
+
+def test_credential_refresh_and_blocked_resume_keep_original_keys(storefront, monkeypatch):
+    storefront.order("Rotated key", 1)
+    attempts = []
+
+    class Sender:
+        def __init__(self, base_url, api_key, **kwargs):
+            self.key = api_key
+
+        def emit(self, event_type, payload, *, idempotency_key):
+            attempts.append((self.key, idempotency_key))
+            if self.key != "new_project_key":
+                raise RelayError("HTTP 401", idempotency_key=idempotency_key, status=401)
+            return {"created": False, "event": {"id": "evt_" + event_type}}
+
+    monkeypatch.setattr(example, "RelayClient", Sender)
+    storefront.send_pending()
+    assert storefront.state()["blocked_count"] == 2
+    assert storefront.update_credentials("new_project_key", resume_blocked=True) == 2
+    storefront.send_pending()
+    assert storefront.state()["outbox"] == []
+    assert [key for _, key in attempts[:2]] == [key for _, key in attempts[2:]]
+    assert all(key == "new_project_key" for key, _ in attempts[2:])
+
+
+def test_old_inflight_auth_failure_cannot_reblock_after_credential_refresh(storefront, monkeypatch):
+    storefront.order("Rotating", 1)
+
+    class Sender:
+        def __init__(self, base_url, api_key, **kwargs):
+            self.key = api_key
+
+        def emit(self, event_type, payload, *, idempotency_key):
+            if self.key != "new_project_key":
+                storefront.update_credentials("new_project_key", resume_blocked=True)
+                raise RelayError(
+                    "Old in-flight HTTP 401", idempotency_key=idempotency_key, status=401
+                )
+            return {"created": True, "event": {"id": "evt_" + event_type}}
+
+    monkeypatch.setattr(example, "RelayClient", Sender)
+    storefront.send_pending(now=1000)
+    assert storefront.state()["blocked_count"] == 0
+    storefront.send_pending(now=1002)
+    assert storefront.state()["outbox"] == []
+
+
+def test_resume_api_is_guarded_and_does_not_change_conflicting_keys(storefront):
+    storefront.order("Conflict", 1)
+    with storefront.db() as db:
+        db.execute("UPDATE outbox SET blocked=1,last_error='HTTP 409'")
+        keys = [row[0] for row in db.execute("SELECT idempotency_key FROM outbox ORDER BY id")]
+    with TestClient(
+        example.create_app(storefront, run_sender=False), base_url="http://127.0.0.1:9000"
+    ) as client:
+        assert client.post("/api/outbox/resume", json={}).status_code == 403
+        result = client.post("/api/outbox/resume", json={}, headers={"X-Storefront-Request": "1"})
+        assert result.json() == {"resumed": 2}
+    with storefront.db() as db:
+        assert [
+            row[0] for row in db.execute("SELECT idempotency_key FROM outbox ORDER BY id")
+        ] == keys
+    assert storefront.state()["blocked_count"] == 0
+
+
+def test_receiver_signing_credentials_refresh_without_restart(storefront):
+    order_id = storefront.order("Rotated secret", 1)
+    new_secret = "whsec_" + base64.b64encode(b"n" * 32).decode()
+    raw = json.dumps(
+        {"id": "evt_rotation", "type": "order.created", "data": {"order_id": order_id}}
+    ).encode()
+    with TestClient(
+        example.create_app(storefront, run_sender=False), base_url="http://127.0.0.1:9000"
+    ) as client:
+        storefront.update_credentials(signing_secrets={"warehouse": new_secret})
+        assert (
+            client.post(
+                "/hooks/warehouse", content=raw, headers=sign_headers(SECRET, "evt_rotation", raw)
+            ).status_code
+            == 401
+        )
+        assert (
+            client.post(
+                "/hooks/warehouse",
+                content=raw,
+                headers=sign_headers(new_secret, "evt_rotation", raw),
+            ).status_code
+            == 200
+        )
+        assert new_secret not in client.get("/api/state").text
+
+
+def test_invalid_credential_update_is_atomic_and_does_not_resume(storefront):
+    storefront.order("Blocked", 1)
+    with storefront.db() as db:
+        db.execute("UPDATE outbox SET blocked=1")
+    original = storefront.config()
+    with pytest.raises(ValueError, match="signing secret"):
+        storefront.update_credentials("new_project_key", {"warehouse": "invalid"}, True)
+    assert storefront.config() == original
+    assert storefront.state()["blocked_count"] == 2
 
 
 def test_slow_outage_cannot_starve_later_orders_and_stop_interrupts_batch(storefront, monkeypatch):

@@ -20,7 +20,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__
 from .config import Settings
-from .delivery import validate_endpoint
+from .delivery import DeliveryCapacityUnavailable, validate_endpoint
+from .events import PayloadTooLarge
 from .operations import CapacityExceeded, IdempotencyExpired, Operations
 from .store import STATUSES, IdempotencyConflict, Store
 from .worker import Worker
@@ -202,12 +203,13 @@ def make_worker(store, settings):
         allow_private=settings.allow_private_networks,
         max_attempts=settings.max_attempts,
         retry_base=settings.retry_base,
+        concurrency=settings.worker_concurrency,
     )
 
 
 def create_app(settings=None):
     settings = settings or Settings.from_env()
-    store = Store(settings.db_path)
+    store = Store(settings.db_path, max_delivery_bytes=settings.max_payload_bytes)
     operations = Operations(store, settings.operations_policy(), settings.allow_private_networks)
     failed_attempts = OrderedDict()
     auth_lock = threading.Lock()
@@ -253,6 +255,20 @@ def create_app(settings=None):
     app.state.operations = operations
     app.state.demo_project = app.state.demo_receiver = None
     app.add_middleware(BodyLimit, max_bytes=settings.max_payload_bytes)
+
+    @app.exception_handler(PayloadTooLarge)
+    async def payload_size_error(_request, _exc):
+        return JSONResponse(
+            {"detail": "Serialized delivery body is too large; event was not accepted"}, 413
+        )
+
+    @app.exception_handler(DeliveryCapacityUnavailable)
+    async def resolver_capacity_error(_request, _exc):
+        return JSONResponse(
+            {"detail": "DNS capacity is temporarily unavailable; retry this request later"},
+            503,
+            headers={"Retry-After": "1"},
+        )
 
     @app.exception_handler(CapacityExceeded)
     async def capacity_error(_request, _exc):
@@ -386,6 +402,16 @@ def create_app(settings=None):
             check_origin(request, True)
 
     protected = [Depends(admin)]
+
+    def metrics_access(request: Request):
+        token = bearer(request)
+        if settings.metrics_token and token:
+            try:
+                if hmac.compare_digest(token.encode(), settings.metrics_token.encode()):
+                    return
+            except UnicodeError:
+                pass
+        admin(request)
 
     def project(project_id):
         if not any(p["id"] == project_id for p in store.list_projects()):
@@ -527,7 +553,12 @@ def create_app(settings=None):
         project(project_id)
         return operations.summary(project_id)
 
-    @app.get("/metrics", dependencies=protected, response_class=PlainTextResponse)
+    @app.api_route(
+        "/metrics",
+        methods=["GET", "HEAD"],
+        dependencies=[Depends(metrics_access)],
+        response_class=PlainTextResponse,
+    )
     def prometheus():
         return PlainTextResponse(operations.prometheus(), media_type="text/plain; version=0.0.4")
 

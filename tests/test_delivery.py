@@ -321,6 +321,7 @@ def isolated_dns(monkeypatch):
     monkeypatch.setattr(delivery_module, "_DNS_LOCK", threading.Lock())
     monkeypatch.setattr(delivery_module, "_DNS_INFLIGHT", {})
     monkeypatch.setattr(delivery_module, "_DNS_HOSTS", {})
+    monkeypatch.setattr(delivery_module, "_DNS_PROJECT_COUNTS", {})
     monkeypatch.setattr(delivery_module, "_DNS_FAILURES", OrderedDict())
     yield
     deadline = time.monotonic() + 2
@@ -328,6 +329,7 @@ def isolated_dns(monkeypatch):
         time.sleep(0.01)
     assert not delivery_module._DNS_INFLIGHT
     assert not delivery_module._DNS_HOSTS
+    assert not delivery_module._DNS_PROJECT_COUNTS
 
 
 def test_dns_coalesces_waiters_without_delaying_healthy_host(monkeypatch, isolated_dns):
@@ -409,7 +411,7 @@ def test_dns_slots_are_retained_until_os_calls_finish(monkeypatch, isolated_dns)
                 delivery_module._resolve(f"host{number}.example", 443, time.monotonic() + 0.02)
         assert len(delivery_module._DNS_INFLIGHT) == 8
         assert not delivery_module._DNS_SLOTS.acquire(blocking=False)
-        with pytest.raises(TimeoutError, match="capacity"):
+        with pytest.raises(delivery_module.DeliveryCapacityUnavailable, match="capacity"):
             delivery_module._resolve("ninth.example", 443, time.monotonic() + 1)
         assert len(calls) == 8
     finally:
@@ -443,3 +445,83 @@ def test_dns_negative_cache_is_bounded_expires_and_is_transient(monkeypatch, iso
     delivery_module._DNS_FAILURES["host3.example"] = (time.monotonic() - 1, False)
     deliver("https://host3.example/", b"{}", {})
     assert calls.count("host3.example") == 2
+
+
+def test_project_dns_allowance_survives_caller_timeout_and_protects_other_projects(
+    monkeypatch, isolated_dns
+):
+    release = threading.Event()
+    calls = []
+
+    def lookup(host, port, **_):
+        calls.append(host)
+        if host.startswith("slow"):
+            assert release.wait(3)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", lookup)
+    try:
+        for index in range(2):
+            with pytest.raises(delivery_module.DNSResolutionTimeout):
+                delivery_module._resolve(
+                    f"slow{index}.example", 443, time.monotonic() + 0.02, "prj_a"
+                )
+        assert delivery_module._DNS_PROJECT_COUNTS == {"prj_a": 2}
+        result = deliver("https://slow3.example/", b"{}", {}, resolver_scope="prj_a")
+        assert result.deferred_reason == "dns_project_capacity"
+        assert not result.timed_out and not result.permanent
+        assert "slow3.example" not in calls
+        assert delivery_module._resolve("healthy.example", 443, time.monotonic() + 1, "prj_b")
+        validate_endpoint("https://operator.example/")
+        assert delivery_module._DNS_PROJECT_COUNTS == {"prj_a": 2}
+    finally:
+        release.set()
+
+
+def test_delivery_dns_limit_reserves_control_capacity(monkeypatch, isolated_dns):
+    release = threading.Event()
+    calls = []
+
+    def lookup(host, port, **_):
+        calls.append(host)
+        if host.startswith("slow"):
+            assert release.wait(3)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", lookup)
+    try:
+        for index in range(6):
+            with pytest.raises(delivery_module.DNSResolutionTimeout):
+                delivery_module._resolve(
+                    f"slow{index}.example", 443, time.monotonic() + 0.02, f"prj_{index // 2}"
+                )
+        result = deliver("https://another.example/", b"{}", {}, resolver_scope="prj_new")
+        assert result.deferred_reason == "dns_global_capacity"
+        assert "another.example" not in calls
+        validate_endpoint("https://operator.example/")
+        assert "operator.example" in calls
+        assert sum(delivery_module._DNS_PROJECT_COUNTS.values()) == 6
+        for index in range(2):
+            with pytest.raises(delivery_module.DNSResolutionTimeout):
+                delivery_module._resolve(
+                    f"slow-control{index}.example", 443, time.monotonic() + 0.02
+                )
+        with pytest.raises(delivery_module.DeliveryCapacityUnavailable):
+            validate_endpoint("https://operator-new.example/")
+        assert len(delivery_module._DNS_INFLIGHT) == 8
+    finally:
+        release.set()
+
+
+def test_dns_start_failure_returns_project_and_global_capacity(monkeypatch, isolated_dns):
+    def failed_start(_):
+        raise RuntimeError("Unable to start a thread")
+
+    monkeypatch.setattr(threading.Thread, "start", failed_start)
+    with pytest.raises(delivery_module.DNSResolutionError):
+        delivery_module._resolve("receiver.example", 443, time.monotonic() + 1, "prj_a")
+    assert not delivery_module._DNS_PROJECT_COUNTS
+    assert not delivery_module._DNS_INFLIGHT
+    assert all(delivery_module._DNS_SLOTS.acquire(blocking=False) for _ in range(8))
+    for _ in range(8):
+        delivery_module._DNS_SLOTS.release()
